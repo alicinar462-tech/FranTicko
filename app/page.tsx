@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import {
   useCallback,
   useEffect,
@@ -394,20 +395,15 @@ export default function Home() {
     <main className="min-h-screen bg-zinc-950 text-zinc-100">
       <div className="mx-auto w-full max-w-7xl px-6 py-8 lg:px-8">
         <header className="mb-8 flex flex-col gap-5 border-b border-zinc-800 pb-6 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-white text-sm font-bold text-zinc-950">
-              FT
-            </div>
-
-            <div>
-              <h1 className="text-xl font-semibold tracking-tight">
-                FranTicko
-              </h1>
-
-              <p className="text-xs text-zinc-500">
-                Ticko API Integration Demo
-              </p>
-            </div>
+          <div className="flex items-center">
+            <Image
+              src="/franticko-logo.png"
+              alt="FranTicko"
+              width={120}
+              height={75}
+              priority
+              className="h-[72px] w-[120px] object-contain"
+            />
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
