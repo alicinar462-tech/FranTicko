@@ -1,36 +1,115 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# FranTicko
+
+A [Next.js](https://nextjs.org) project built with TypeScript and the App
+Router. This repository is the project workspace for the **Ticko API
+Integration Challenge** and contains a working Ticko **Testnet** API
+integration.
+
+## What's implemented
+
+- **Ticko Testnet API integration** via `lib/ticko/*` (a small typed client that
+  wraps the public REST endpoints).
+- **Type A EIP-712 signing** (`lib/ticko/auth.ts`) for authenticated write
+  operations, including strictly-increasing, per-signer request nonces.
+- **Agent Wallet signing** — write requests are signed by an Agent/API key
+  (`signer_address`) using the configured agent private key.
+- **target_address support** — orders operate on a main account
+  (`target_address`) separate from the signing Agent wallet.
+- **Market symbols** — `GET /market/symbols` via the client.
+- **Account balance** — `GET /account/balance`.
+- **Place Order** — `POST /trade/orders` (limit/market, buy/sell, cross/isolated,
+  GTC/IOC/FOK, `post_only`, position side).
+- **Modify Order** — `POST /trade/orders/modify` (price changes).
+- **Cancel Order** — `POST /trade/orders/cancel`.
+- **Order Detail** — `GET /trade/order`.
+- **Executions** — `GET /trade/executions`.
+- **Price Match** — supported via the `price_match` field (`queue_1`, `queue_5`,
+  `counter_party_1`, `counter_party_5`).
+- **Server-side secret handling** — the private key is read only from the
+  server environment and is never sent to the browser.
+
+A minimal verification route is available at
+`GET /api/ticko/symbols` (proxies `getSymbols()`).
+
+## Security
+
+**`TICKO_AGENT_PRIVATE_KEY` is server-side only and must never be exposed to
+the browser or committed to source control.** It is read from `.env.local`,
+which is git-ignored. Keep it out of client components and out of any committed
+files.
+
+## Testnet default
+
+**`TICKO_BASE_URL` defaults to the Ticko Testnet**
+(`https://api.testnet.ticko.xyz/v1`). Set it explicitly if you intend to target
+any other environment. Testnet is the supported default.
+
+## Prerequisites
+
+- Node.js (LTS)
+- npm
 
 ## Getting Started
 
-First, run the development server:
+Install dependencies:
+
+```bash
+npm install
+```
+
+Copy the environment template and fill in your values:
+
+```bash
+cp .env.example .env.local
+```
+
+Run the development server:
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000) with your browser to see the
+result.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Scripts
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+- `npm run dev` — start the development server
+- `npm run build` — create a production build
+- `npm run start` — start the production server
+- `npm run lint` — run ESLint
 
-## Learn More
+## Environment Variables
 
-To learn more about Next.js, take a look at the following resources:
+See the `.env.example` file for the available configuration variables:
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+- `TICKO_BASE_URL` — Ticko REST base URL (defaults to Testnet).
+- `TICKO_AGENT_PRIVATE_KEY` — **secret.** Agent/API signer private key.
+- `TICKO_ACCOUNT_ADDRESS` — main account operated on (`target_address`).
+- `TICKO_AGENT_ADDRESS` — Agent wallet used as `signer_address`.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Never commit real values. Use a local `.env.local` (git-ignored).
 
-## Deploy on Vercel
+## Tested on Ticko Testnet
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+Concise verification performed against Ticko Testnet (BTC-USDT, symbol 20001,
+quantity 0.001 per order):
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- **Maker order placed and filled** via a post-only limit buy (resolved at
+  best bid; `is_maker = true`, maker fee).
+- **Modify** — a resting order's price was updated successfully.
+- **Cancel** — a resting order was cancelled to a terminal `cancelled` state
+  with zero executions.
+- **Price Match** — a `price_match = "queue_1"` buy was accepted and rested,
+  then filled as a maker at the resolving best-bid price.
+
+## Roadmap
+
+The following items have **not** been completed and are not claimed here:
+
+- The full 10M API-trading-volume requirement (definition is external to the
+  Ticko API docs and has not been verified).
+- Demonstrating all four `price_match` values (only `queue_1` was verified).
+- Earning or confirming a challenge reward.
+- Production/mainnet support (this project targets the Ticko **Testnet** by
+  default).
