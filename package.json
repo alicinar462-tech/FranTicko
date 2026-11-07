@@ -1,3 +1,4 @@
+
 {
   "name": "franticko",
   "version": "0.1.0",
@@ -9,7 +10,7 @@
     "lint": "eslint"
   },
   "dependencies": {
-    "next": "16.3.5",
+    "next": "16.4.5",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "viem": "^2.56.5"
@@ -20,8 +21,15 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
-    "eslint-config-next": "16.3.5",
+    "eslint-config-next": "16.4.5",
     "tailwindcss": "^4",
     "typescript": "^5"
+  },
+  "overrides": {
+    "typescript-eslint": {
+      "@typescript-eslint/typescript-estree": {
+        "minimatch": "11.0.1"
+      }
+    }
   }
 }

@@ -1,25 +1,19 @@
+
 import type { Address, Hex } from "viem";
+
 import { signTypeA, TickoActionTag, type CanonicalValue } from "./auth";
+
 import type {
   TickoBalanceData,
   TickoEnvelope,
+  TickoOrderBookData,
   TickoPlaceOrderData,
   TickoPlaceOrderFields,
   TickoSymbolsData,
 } from "./types";
 
-/**
- * Public Testnet REST base URL, used unless overridden by `TICKO_BASE_URL`.
- * See https://docs.ticko.xyz/api-documentation/overview/rest-conventions
- */
 const DEFAULT_TICKO_BASE_URL = "https://api.testnet.ticko.xyz/v1";
 
-/**
- * Returns the configured Ticko base URL, trimming trailing slashes.
- *
- * Read inside a function so the value is resolved at request time rather
- * than inlined at build time, keeping the server-side client configurable.
- */
 function getBaseUrl(): string {
   return (process.env.TICKO_BASE_URL ?? DEFAULT_TICKO_BASE_URL).replace(
     /\/+$/,
@@ -28,26 +22,16 @@ function getBaseUrl(): string {
 }
 
 export interface GetSymbolsOptions {
-  /** Optional signal to cancel the underlying request. */
   signal?: AbortSignal;
 }
 
-/**
- * Fetch the trading-pair configuration from the public market API.
- *
- * `GET /market/symbols` — public read endpoint, no authentication required.
- * Returns the raw `data` payload of the Ticko response envelope.
- *
- * @throws Error with a descriptive message if the request fails at the
- *         transport level, returns a non-2xx status, or carries a
- *         non-success response envelope (`code !== "0"`).
- */
 export async function getSymbols(
   options: GetSymbolsOptions = {},
 ): Promise<TickoSymbolsData> {
   const url = `${getBaseUrl()}/market/symbols`;
 
   let response: Response;
+
   try {
     response = await fetch(url, {
       method: "GET",
@@ -72,6 +56,7 @@ export async function getSymbols(
   }
 
   let envelope: TickoEnvelope<TickoSymbolsData>;
+
   try {
     envelope = (await response.json()) as TickoEnvelope<TickoSymbolsData>;
   } catch {
@@ -80,7 +65,6 @@ export async function getSymbols(
     );
   }
 
-  // `code === "0"` signals success per the Ticko response envelope.
   if (envelope.code !== "0") {
     throw new Error(
       `Ticko GET /market/symbols failed (code=${envelope.code}, msg=${envelope.msg}, trace_code=${envelope.trace_code})`,
@@ -91,22 +75,9 @@ export async function getSymbols(
 }
 
 export interface GetBalanceOptions {
-  /** Optional signal to cancel the underlying request. */
   signal?: AbortSignal;
 }
 
-/**
- * Fetch the account asset balances for a given address.
- *
- * `GET /account/balance` — public read endpoint, no authentication required.
- * Returns the raw `data` payload of the Ticko response envelope.
- *
- * @param address The account address to query.
- * @param options Optional request options.
- * @throws Error with a descriptive message if the request fails at the
- *         transport level, returns a non-2xx status, or carries a
- *         non-success response envelope (`code !== "0"`).
- */
 export async function getBalance(
   address: string,
   options: GetBalanceOptions = {},
@@ -116,6 +87,7 @@ export async function getBalance(
   )}`;
 
   let response: Response;
+
   try {
     response = await fetch(url, {
       method: "GET",
@@ -140,6 +112,7 @@ export async function getBalance(
   }
 
   let envelope: TickoEnvelope<TickoBalanceData>;
+
   try {
     envelope = (await response.json()) as TickoEnvelope<TickoBalanceData>;
   } catch {
@@ -148,7 +121,6 @@ export async function getBalance(
     );
   }
 
-  // `code === "0"` signals success per the Ticko response envelope.
   if (envelope.code !== "0") {
     throw new Error(
       `Ticko GET /account/balance failed (code=${envelope.code}, msg=${envelope.msg}, trace_code=${envelope.trace_code})`,
@@ -159,90 +131,127 @@ export async function getBalance(
 }
 
 /**
- * Default TTL (in ms) applied to the `expires_after` field when no explicit
- * TTL is supplied: `expires_after = nonce + expiresTtl`.
+ * Fetch the Level 2 order book for a Ticko Testnet trading pair.
+ *
+ * GET /market/l2_book — public read endpoint.
+ * No authentication or signing is required.
+ */
+export interface GetOrderBookOptions {
+  /** Number of order book levels requested by the API. */
+  level?: number;
+  /** Optional signal to cancel the underlying request. */
+  signal?: AbortSignal;
+}
+
+export async function getOrderBook(
+  symbolId: number,
+  options: GetOrderBookOptions = {},
+): Promise<TickoOrderBookData> {
+  const level = options.level ?? 1;
+
+  if (!Number.isInteger(symbolId) || symbolId <= 0) {
+    throw new Error("Ticko Order Book requires a valid symbol ID.");
+  }
+
+  if (!Number.isInteger(level) || level <= 0) {
+    throw new Error("Ticko Order Book level must be a positive integer.");
+  }
+
+  const url = `${getBaseUrl()}/market/l2_book?symbol_id=${encodeURIComponent(
+    String(symbolId),
+  )}&level=${encodeURIComponent(String(level))}`;
+
+  let response: Response;
+
+  try {
+    response = await fetch(url, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      signal: options.signal,
+      cache: "no-store",
+    });
+  } catch (error) {
+    throw new Error(
+      `Ticko GET /market/l2_book network error: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+
+  if (!response.ok) {
+    const bodyText = await response.text().catch(() => "");
+    throw new Error(
+      `Ticko GET /market/l2_book failed with HTTP ${response.status}${
+        bodyText ? `: ${bodyText}` : ""
+      }`,
+    );
+  }
+
+  let envelope: TickoEnvelope<TickoOrderBookData>;
+
+  try {
+    envelope = (await response.json()) as TickoEnvelope<TickoOrderBookData>;
+  } catch {
+    throw new Error(
+      "Ticko GET /market/l2_book returned a non-JSON response.",
+    );
+  }
+
+  if (envelope.code !== "0") {
+    throw new Error(
+      `Ticko GET /market/l2_book failed (code=${envelope.code}, msg=${envelope.msg}, trace_code=${envelope.trace_code})`,
+    );
+  }
+
+  return envelope.data;
+}
+
+/**
+ * Default TTL applied to expires_after when no explicit TTL is supplied.
  */
 const DEFAULT_EXPIRES_TTL_MS = 60_000;
 
 /**
- * In-memory nonce state keyed by signer address (lower-cased).
- *
- * Nonces must be strictly increasing per signer and additionally unique, so
- * when a nonce is generated it is always at least `Date.now()` and strictly
- * greater than the previously generated/used nonce for that signer. This map
- * is process-local, so a fresh process starts from `Date.now()` again.
+ * In-memory nonce state keyed by signer address.
  */
 const lastNonceBySigner = new Map<string, number>();
 
-/**
- * Resolve the nonce for a signer.
- *
- * - If `explicitNonce` is supplied, use it and store it for that signer.
- * - Otherwise generate one as `Math.max(Date.now(), previousNonce + 1)` and
- *   store it, guaranteeing a strictly increasing sequence per signer.
- *
- * Accepts an already normalized (lower-cased) signer key.
- */
 function resolveNonce(
   signerKey: string,
   explicitNonce: number | undefined,
 ): number {
   const previous = lastNonceBySigner.get(signerKey);
+
   if (explicitNonce !== undefined) {
     lastNonceBySigner.set(signerKey, explicitNonce);
     return explicitNonce;
   }
+
   const generated =
     previous === undefined ? Date.now() : Math.max(Date.now(), previous + 1);
+
   lastNonceBySigner.set(signerKey, generated);
+
   return generated;
 }
 
 export interface PlaceOrderParams {
-  /** Hex private key of `signer_address`, passed to `signTypeA`. */
   privateKey: Hex;
-  /** Signer address used in both the `Agent` struct and request body. */
   signerAddress: Address;
-  /** Business fields to sign and submit (envelope fields excluded). */
   businessFields: TickoPlaceOrderFields;
-  /** Optional account the order operates on (maps to `target_address`). */
   targetAddress?: Address;
-  /**
-   * Optional explicit nonce. If omitted, a strictly-increasing millisecond
-   * timestamp nonce is generated for the signer.
-   */
   nonce?: number;
-  /**
-   * Milliseconds added to the nonce to derive `expires_after`. Defaults to
-   * `60_000`.
-   */
   expiresTtl?: number;
 }
 
 export interface PlaceOrderOptions {
-  /** Optional signal to cancel the underlying request. */
   signal?: AbortSignal;
 }
 
 /**
  * Place an order on the Ticko trade API.
  *
- * `POST /trade/orders` — an authenticated, signed write endpoint. This uses
- * Signing Type A (see {@link signTypeA}) with action tag
- * {@link TickoActionTag.PlaceOrder}, signing only the `businessFields`
- * (never the envelope fields). The final flattened request body combines the
- * business fields with `signer_address`, `nonce`, `expires_after`, an optional
- * `target_address`, and the computed `signature`.
- *
- * Nonce handling:
- * - No explicit nonce: generated as `Math.max(Date.now(), previousNonce + 1)`
- *   and strictly increasing per signer.
- * - Explicit nonce: used as-is and stored for the signer.
- * - `expires_after = nonce + expiresTtl` (default TTL `60_000` ms).
- *
- * @throws Error with a descriptive message if the request fails at the
- *         transport level, returns a non-2xx status, or carries a non-success
- *         response envelope (`code !== "0"`).
+ * POST /trade/orders — authenticated, signed write endpoint.
  */
 export async function placeOrder(
   params: PlaceOrderParams,
@@ -255,17 +264,9 @@ export async function placeOrder(
   const nonce = resolveNonce(signerKey, params.nonce);
   const expiresAfter = nonce + expiresTtl;
 
-  // Sign ONLY the business fields. Envelope fields (`signer_address`, `nonce`,
-  // `expires_after`, `target_address`, `signature`) are deliberately excluded
-  // from the signed payload.
   const signature = await signTypeA({
     privateKey,
     actionTag: TickoActionTag.PlaceOrder,
-    // `TickoPlaceOrderFields` is a plain-object interface and is therefore
-    // runtime-compatible with `canonicalize()`, but TypeScript cannot
-    // auto-assign an interface to `CanonicalValue` (no index signature). The
-    // cast is a type-only bridge; the exact `businessFields` object is signed
-    // unchanged.
     businessFields: businessFields as unknown as CanonicalValue,
     signerAddress,
     nonce,
@@ -285,6 +286,7 @@ export async function placeOrder(
   const url = `${getBaseUrl()}/trade/orders`;
 
   let response: Response;
+
   try {
     response = await fetch(url, {
       method: "POST",
@@ -313,13 +315,13 @@ export async function placeOrder(
   }
 
   let envelope: TickoEnvelope<TickoPlaceOrderData>;
+
   try {
     envelope = (await response.json()) as TickoEnvelope<TickoPlaceOrderData>;
   } catch {
     throw new Error("Ticko POST /trade/orders returned a non-JSON response.");
   }
 
-  // `code === "0"` signals success per the Ticko response envelope.
   if (envelope.code !== "0") {
     throw new Error(
       `Ticko POST /trade/orders failed (code=${envelope.code}, msg=${envelope.msg}, trace_code=${envelope.trace_code})`,

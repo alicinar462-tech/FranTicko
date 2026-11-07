@@ -2,19 +2,15 @@
 
 import Image from "next/image";
 import {
+  TickoOrderBookStream,
+  type TickoStreamStatus,
+} from "../lib/ticko/orderbook-stream";
+import {
   useCallback,
   useEffect,
   useMemo,
   useState,
 } from "react";
-import {
-  createPublicClient,
-  createWalletClient,
-  custom,
-  defineChain,
-  type Address,
-  type EIP1193Provider,
-} from "viem";
 
 interface TickoSymbol {
   symbol_id: number;
@@ -45,6 +41,22 @@ interface BalanceData {
   coins: BalanceCoin[];
 }
 
+type TickoOrderBookLevel = [price: string, quantity: string];
+
+interface OrderBookData {
+  asks: TickoOrderBookLevel[];
+  bids: TickoOrderBookLevel[];
+  seq: number;
+  symbol_id: number;
+  time: number;
+}
+
+interface OrderBookResponse {
+  ok: boolean;
+  data?: OrderBookData;
+  error?: string;
+}
+
 interface SymbolsResponse {
   ok: boolean;
   data?: {
@@ -59,29 +71,26 @@ interface BalanceResponse {
   error?: string;
 }
 
-declare global {
-  interface Window {
-    ethereum?: EIP1193Provider;
-  }
+interface DisplayOrderBookLevel {
+  price: string;
+  quantity: string;
+  cumulative: number;
+  depthPercent: number;
 }
 
 const BTC_USDT_SYMBOL_ID = 20001;
 const USDT_COIN_ID = 1001;
 
-const tickoTestnet = defineChain({
-  id: 84257,
-  name: "Ticko Testnet",
-  nativeCurrency: {
-    name: "Ether",
-    symbol: "ETH",
-    decimals: 18,
-  },
-  rpcUrls: {
-    default: {
-      http: ["https://rpc.testnet.ticko.xyz"],
-    },
-  },
-});
+const PRICE_MATCH_OPTIONS = [
+  "queue_1",
+  "queue_5",
+  "counter_party_1",
+  "counter_party_5",
+] as const;
+
+type OrderSide = "buy" | "sell";
+type OrderMode = "maker" | "taker";
+type PriceMatch = (typeof PRICE_MATCH_OPTIONS)[number] | "";
 
 function shortenAddress(address: string) {
   if (!address) return "—";
@@ -107,27 +116,65 @@ function formatNumber(
   }).format(number);
 }
 
+function buildDepthLevels(
+  levels: TickoOrderBookLevel[],
+): DisplayOrderBookLevel[] {
+  let cumulative = 0;
+
+  const parsed = levels.map(([price, quantity]) => {
+    const numericQuantity = Number(quantity);
+
+    cumulative += Number.isFinite(numericQuantity)
+      ? numericQuantity
+      : 0;
+
+    return {
+      price,
+      quantity,
+      cumulative,
+    };
+  });
+
+  const maxCumulative = Math.max(
+    ...parsed.map((level) => level.cumulative),
+    0,
+  );
+
+  return parsed.map((level) => ({
+    ...level,
+    depthPercent:
+      maxCumulative > 0
+        ? (level.cumulative / maxCumulative) * 100
+        : 0,
+  }));
+}
+
 export default function Home() {
   const [symbol, setSymbol] = useState<TickoSymbol | null>(null);
   const [balance, setBalance] = useState<BalanceData | null>(null);
+  const [orderBook, setOrderBook] = useState<OrderBookData | null>(null);
 
-  const [walletAddress, setWalletAddress] =
-    useState<Address | null>(null);
-
-  const [walletChainId, setWalletChainId] =
-    useState<number | null>(null);
-
-  const [walletError, setWalletError] = useState("");
-  const [connectingWallet, setConnectingWallet] =
-    useState(false);
-  const [switchingNetwork, setSwitchingNetwork] =
-    useState(false);
+  const [streamStatus, setStreamStatus] =
+    useState<TickoStreamStatus>("disconnected");
 
   const [loadingMarket, setLoadingMarket] = useState(true);
   const [loadingBalance, setLoadingBalance] = useState(true);
+  const [loadingOrderBook, setLoadingOrderBook] = useState(true);
 
   const [marketError, setMarketError] = useState("");
   const [balanceError, setBalanceError] = useState("");
+  const [orderBookError, setOrderBookError] = useState("");
+
+  const [orderMode, setOrderMode] =
+    useState<OrderMode>("maker");
+  const [orderSide, setOrderSide] =
+    useState<OrderSide>("buy");
+  const [priceMatch, setPriceMatch] =
+    useState<PriceMatch>("");
+
+  const [orderPrice, setOrderPrice] = useState("");
+  const [orderQuantity, setOrderQuantity] =
+    useState("0.001");
 
   const loadMarket = useCallback(async () => {
     setLoadingMarket(true);
@@ -197,180 +244,85 @@ export default function Home() {
     }
   }, []);
 
+  const loadOrderBook = useCallback(async () => {
+    setLoadingOrderBook(true);
+    setOrderBookError("");
+
+    try {
+      const response = await fetch(
+        `/api/ticko/orderbook?symbol_id=${BTC_USDT_SYMBOL_ID}&level=1`,
+        { cache: "no-store" },
+      );
+
+      const result = (await response.json()) as OrderBookResponse;
+
+      if (!response.ok || !result.ok || !result.data) {
+        throw new Error(
+          result.error ?? "Unable to load order book data.",
+        );
+      }
+
+      setOrderBook(result.data);
+    } catch (error) {
+      setOrderBookError(
+        error instanceof Error
+          ? error.message
+          : "Unable to load order book data.",
+      );
+    } finally {
+      setLoadingOrderBook(false);
+    }
+  }, []);
+
   const refreshAll = useCallback(() => {
     void loadMarket();
     void loadBalance();
-  }, [loadBalance, loadMarket]);
-
-  const connectWallet = useCallback(async () => {
-    setWalletError("");
-
-    if (!window.ethereum) {
-      setWalletError(
-        "No EVM wallet detected. Install MetaMask or another compatible wallet.",
-      );
-      return;
-    }
-
-    setConnectingWallet(true);
-
-    try {
-      const walletClient = createWalletClient({
-        chain: tickoTestnet,
-        transport: custom(window.ethereum),
-      });
-
-      const [address] = await walletClient.requestAddresses();
-
-      if (!address) {
-        throw new Error("No wallet address was returned.");
-      }
-
-      setWalletAddress(address);
-
-      const publicClient = createPublicClient({
-        chain: tickoTestnet,
-        transport: custom(window.ethereum),
-      });
-
-      const chainId = await publicClient.getChainId();
-      setWalletChainId(chainId);
-    } catch (error) {
-      setWalletError(
-        error instanceof Error
-          ? error.message
-          : "Wallet connection failed.",
-      );
-    } finally {
-      setConnectingWallet(false);
-    }
-  }, []);
-
-  const disconnectWallet = useCallback(() => {
-    setWalletAddress(null);
-    setWalletChainId(null);
-    setWalletError("");
-  }, []);
-
-  const switchToTickoTestnet = useCallback(async () => {
-    setWalletError("");
-
-    if (!window.ethereum) {
-      setWalletError(
-        "No EVM wallet detected. Install MetaMask or another compatible wallet.",
-      );
-      return;
-    }
-
-    setSwitchingNetwork(true);
-
-    try {
-      const walletClient = createWalletClient({
-        chain: tickoTestnet,
-        transport: custom(window.ethereum),
-      });
-
-      await walletClient.switchChain({
-        id: tickoTestnet.id,
-      });
-
-      const publicClient = createPublicClient({
-        chain: tickoTestnet,
-        transport: custom(window.ethereum),
-      });
-
-      const chainId = await publicClient.getChainId();
-      setWalletChainId(chainId);
-    } catch (error) {
-      const message =
-        error instanceof Error
-          ? error.message
-          : "Unable to switch wallet network.";
-
-      setWalletError(
-        message.toLowerCase().includes("4902") ||
-          message.toLowerCase().includes("chain not found") ||
-          message.toLowerCase().includes("unrecognized chain")
-          ? "Ticko Testnet is not configured in your wallet. Please add the network manually."
-          : message,
-      );
-    } finally {
-      setSwitchingNetwork(false);
-    }
-  }, []);
-
-  const refreshWalletState = useCallback(async () => {
-    if (!window.ethereum) {
-      setWalletAddress(null);
-      setWalletChainId(null);
-      return;
-    }
-
-    try {
-      const walletClient = createWalletClient({
-        chain: tickoTestnet,
-        transport: custom(window.ethereum),
-      });
-
-      const accounts = await walletClient.getAddresses();
-
-      setWalletAddress(accounts[0] ?? null);
-
-      const publicClient = createPublicClient({
-        chain: tickoTestnet,
-        transport: custom(window.ethereum),
-      });
-
-      const chainId = await publicClient.getChainId();
-      setWalletChainId(chainId);
-    } catch {
-      setWalletAddress(null);
-      setWalletChainId(null);
-    }
-  }, []);
+    void loadOrderBook();
+  }, [loadBalance, loadMarket, loadOrderBook]);
 
   useEffect(() => {
-    refreshAll();
-    void refreshWalletState();
-  }, [refreshAll, refreshWalletState]);
+    void Promise.resolve().then(refreshAll);
+  }, [refreshAll]);
 
+  // Start the public Ticko WebSocket stream after the market is loaded.
   useEffect(() => {
-    if (!window.ethereum) {
-      return;
-    }
+    if (!symbol) return;
 
-    const handleAccountsChanged = (
-      accounts: readonly Address[],
-    ) => {
-      setWalletAddress(accounts[0] ?? null);
-    };
+    const stream = new TickoOrderBookStream(symbol.symbol_id, {
+      onBook: (book) => {
+        setOrderBook({
+          asks: book.asks,
+          bids: book.bids,
+          seq: book.seq,
+          symbol_id: symbol.symbol_id,
+          time: book.time,
+        });
 
-    const handleChainChanged = (chainId: string) => {
-      setWalletChainId(Number.parseInt(chainId, 16));
-    };
+        setLoadingOrderBook(false);
+        setOrderBookError("");
+      },
+      onStatus: (status) => {
+        setStreamStatus(status);
 
-    window.ethereum.on(
-      "accountsChanged",
-      handleAccountsChanged,
-    );
+        // Never keep displaying an old order book while the stream is
+        // connecting, reconnecting, offline, or in an error state.
+        // The stream reports "connected" only after a fresh snapshot arrives.
+        if (status !== "connected") {
+          setOrderBook(null);
+          setLoadingOrderBook(true);
+        }
+      },
+      onError: (error) => {
+        setOrderBookError(error);
+      },
+    });
 
-    window.ethereum.on(
-      "chainChanged",
-      handleChainChanged,
-    );
+    stream.start();
 
     return () => {
-      window.ethereum?.removeListener?.(
-        "accountsChanged",
-        handleAccountsChanged,
-      );
-
-      window.ethereum?.removeListener?.(
-        "chainChanged",
-        handleChainChanged,
-      );
+      stream.stop();
     };
-  }, []);
+  }, [symbol]);
 
   const usdtBalance = useMemo(() => {
     return (
@@ -380,6 +332,31 @@ export default function Home() {
     );
   }, [balance]);
 
+  const bestBid = orderBook?.bids[0] ?? null;
+  const bestAsk = orderBook?.asks[0] ?? null;
+
+  const spread = useMemo(() => {
+    if (!bestBid || !bestAsk) return null;
+
+    const difference = Number(bestAsk[0]) - Number(bestBid[0]);
+    return Number.isFinite(difference) ? difference : null;
+  }, [bestAsk, bestBid]);
+
+  const askLevels = useMemo(() => {
+    if (!orderBook) return [];
+
+    // API asks are best-to-worst. Reverse for the conventional display:
+    // highest ask at the top, best ask nearest the spread.
+    return buildDepthLevels([...orderBook.asks].reverse());
+  }, [orderBook]);
+
+  const bidLevels = useMemo(() => {
+    if (!orderBook) return [];
+
+    // API bids are already best-to-worst.
+    return buildDepthLevels(orderBook.bids);
+  }, [orderBook]);
+
   const connectionReady =
     !loadingMarket &&
     !loadingBalance &&
@@ -388,8 +365,7 @@ export default function Home() {
     Boolean(symbol) &&
     Boolean(balance);
 
-  const walletOnTickoTestnet =
-    walletChainId === tickoTestnet.id;
+  const priceMatchSelected = priceMatch !== "";
 
   return (
     <main className="min-h-screen bg-zinc-950 text-zinc-100">
@@ -421,116 +397,38 @@ export default function Home() {
               </span>
             </div>
 
-            {walletAddress ? (
-              <div className="flex items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2">
-                <span
-                  className={`h-2 w-2 rounded-full ${
-                    walletOnTickoTestnet
-                      ? "bg-emerald-400"
-                      : "bg-amber-400"
-                  }`}
-                />
-
-                <span className="font-mono text-sm text-zinc-200">
-                  {shortenAddress(walletAddress)}
-                </span>
-
-                <button
-                  type="button"
-                  onClick={disconnectWallet}
-                  className="ml-1 rounded-md px-2 py-1 text-xs text-zinc-400 transition hover:bg-zinc-800 hover:text-white"
-                >
-                  Disconnect
-                </button>
-              </div>
-            ) : (
-              <button
-                type="button"
-                onClick={connectWallet}
-                disabled={connectingWallet}
-                className="rounded-lg bg-white px-4 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-zinc-200 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {connectingWallet
-                  ? "Connecting..."
-                  : "Connect Wallet"}
-              </button>
-            )}
+            <div className="rounded-lg border border-cyan-900/60 bg-cyan-950/20 px-3 py-2 text-xs font-medium text-cyan-300">
+              Agent Pioneer
+            </div>
 
             <button
               type="button"
               onClick={refreshAll}
-              disabled={loadingMarket || loadingBalance}
+              disabled={
+                loadingMarket ||
+                loadingBalance ||
+                loadingOrderBook
+              }
               className="rounded-lg border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {loadingMarket || loadingBalance
+              {loadingMarket || loadingBalance || loadingOrderBook
                 ? "Refreshing..."
                 : "Refresh"}
             </button>
           </div>
         </header>
 
-        {walletError && (
-          <div className="mb-6 rounded-xl border border-red-900/60 bg-red-950/30 px-4 py-3 text-sm text-red-300">
-            {walletError}
-          </div>
-        )}
-
-        {walletAddress && !walletOnTickoTestnet && (
-          <div className="mb-6 flex flex-col gap-3 rounded-xl border border-amber-900/60 bg-amber-950/30 px-4 py-4 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <p className="text-sm text-amber-300">
-                Wallet connected, but it is not currently on
-                Ticko Testnet.
-              </p>
-
-              {walletChainId !== null && (
-                <p className="mt-1 text-xs text-amber-400/70">
-                  Current chain ID: {walletChainId} · Ticko
-                  Testnet: {tickoTestnet.id}
-                </p>
-              )}
-            </div>
-
-            <button
-              type="button"
-              onClick={switchToTickoTestnet}
-              disabled={switchingNetwork}
-              className="shrink-0 rounded-lg bg-amber-300 px-4 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-amber-200 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {switchingNetwork
-                ? "Switching..."
-                : "Switch to Ticko Testnet"}
-            </button>
-          </div>
-        )}
-
         <section className="mb-6 grid gap-4 md:grid-cols-3">
           <div className="rounded-2xl border border-zinc-800 bg-zinc-900/70 p-5">
-            <p className="text-sm text-zinc-500">
-              Connected Wallet
-            </p>
+            <div className="flex items-center justify-between">
+              <p className="text-sm text-zinc-500">
+                Ticko Trading Account
+              </p>
 
-            <div className="mt-3">
-              {walletAddress ? (
-                <p className="font-mono text-sm text-zinc-200">
-                  {shortenAddress(walletAddress)}
-                </p>
-              ) : (
-                <p className="text-sm text-zinc-600">
-                  No wallet connected
-                </p>
-              )}
+              <span className="rounded-full bg-cyan-400/10 px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-cyan-400">
+                API
+              </span>
             </div>
-
-            <p className="mt-2 text-xs text-zinc-600">
-              Browser wallet
-            </p>
-          </div>
-
-          <div className="rounded-2xl border border-zinc-800 bg-zinc-900/70 p-5">
-            <p className="text-sm text-zinc-500">
-              Ticko Account
-            </p>
 
             <div className="mt-3">
               <span className="font-mono text-sm text-zinc-200">
@@ -551,6 +449,24 @@ export default function Home() {
                 {balanceError}
               </p>
             )}
+          </div>
+
+          <div className="rounded-2xl border border-zinc-800 bg-zinc-900/70 p-5">
+            <div className="flex items-center justify-between">
+              <p className="text-sm text-zinc-500">
+                Order Integration
+              </p>
+
+              <span className="h-2 w-2 rounded-full bg-amber-400" />
+            </div>
+
+            <p className="mt-3 text-lg font-semibold">
+              Read-only API
+            </p>
+
+            <p className="mt-2 text-xs text-zinc-600">
+              Account data is available. Order submission is not connected.
+            </p>
           </div>
 
           <div className="rounded-2xl border border-zinc-800 bg-zinc-900/70 p-5">
@@ -581,7 +497,7 @@ export default function Home() {
           </div>
         </section>
 
-        <section className="grid gap-6 lg:grid-cols-[1.5fr_1fr]">
+        <section className="mb-6 grid gap-6 lg:grid-cols-[1.5fr_1fr]">
           <div className="rounded-2xl border border-zinc-800 bg-zinc-900/70">
             <div className="flex items-center justify-between border-b border-zinc-800 px-5 py-4">
               <div>
@@ -608,34 +524,68 @@ export default function Home() {
             </div>
 
             <div className="grid gap-px bg-zinc-800 sm:grid-cols-2">
-              <div className="bg-zinc-900/90 p-6">
+              <div className="bg-zinc-900/90 p-5">
                 <p className="text-sm text-zinc-500">
                   Best Bid
                 </p>
 
-                <p className="mt-2 text-2xl font-semibold">
-                  —
+                <p className="mt-2 text-2xl font-semibold text-emerald-400">
+                  {loadingOrderBook
+                    ? "Loading..."
+                    : bestBid
+                      ? formatNumber(bestBid[0], 1)
+                      : "—"}
                 </p>
 
-                <p className="mt-1 text-xs text-zinc-600">
-                  Order book data not yet connected
+                <p className="mt-1 text-xs text-zinc-500">
+                  {bestBid
+                    ? `Size: ${formatNumber(bestBid[1], 4)} BTC`
+                    : "Best available buy price"}
                 </p>
               </div>
 
-              <div className="bg-zinc-900/90 p-6">
+              <div className="bg-zinc-900/90 p-5">
                 <p className="text-sm text-zinc-500">
                   Best Ask
                 </p>
 
-                <p className="mt-2 text-2xl font-semibold">
-                  —
+                <p className="mt-2 text-2xl font-semibold text-red-400">
+                  {loadingOrderBook
+                    ? "Loading..."
+                    : bestAsk
+                      ? formatNumber(bestAsk[0], 1)
+                      : "—"}
                 </p>
 
-                <p className="mt-1 text-xs text-zinc-600">
-                  Order book data not yet connected
+                <p className="mt-1 text-xs text-zinc-500">
+                  {bestAsk
+                    ? `Size: ${formatNumber(bestAsk[1], 4)} BTC`
+                    : "Best available sell price"}
                 </p>
               </div>
             </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-zinc-800 px-5 py-3">
+              <span className="text-xs text-zinc-500">
+                Spread: {spread === null ? "—" : `${formatNumber(spread, 1)} USDT`}
+              </span>
+
+              <span className="text-xs text-zinc-600">
+                {orderBook
+                  ? `Updated ${new Date(orderBook.time).toLocaleTimeString()}`
+                  : loadingOrderBook
+                    ? "Fetching order book..."
+                    : "Order book unavailable"}
+              </span>
+            </div>
+
+            {orderBookError && (
+              <div className="border-t border-zinc-800 px-5 py-3">
+                <p className="text-sm text-red-400">
+                  {orderBookError}
+                </p>
+              </div>
+            )}
 
             {marketError && (
               <div className="border-t border-zinc-800 px-5 py-4">
@@ -644,6 +594,188 @@ export default function Home() {
                 </p>
               </div>
             )}
+
+            <div className="border-t border-zinc-800 px-5 py-4">
+              <div className="mb-4 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <h3 className="text-sm font-semibold text-zinc-200">
+                    Market Depth
+                  </h3>
+
+                  <span
+                    className={`inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-[10px] font-medium ${
+                      streamStatus === "connected"
+                        ? "bg-emerald-400/10 text-emerald-400"
+                        : streamStatus === "connecting" ||
+                            streamStatus === "reconnecting"
+                          ? "bg-amber-400/10 text-amber-400"
+                          : streamStatus === "error"
+                            ? "bg-red-400/10 text-red-400"
+                            : "bg-zinc-800 text-zinc-500"
+                    }`}
+                  >
+                    <span
+                      className={`h-1.5 w-1.5 rounded-full ${
+                        streamStatus === "connected"
+                          ? "bg-emerald-400"
+                          : streamStatus === "connecting" ||
+                              streamStatus === "reconnecting"
+                            ? "bg-amber-400"
+                            : streamStatus === "error"
+                              ? "bg-red-400"
+                              : "bg-zinc-500"
+                      }`}
+                    />
+
+                    {streamStatus === "connected"
+                      ? "Live"
+                      : streamStatus === "connecting"
+                        ? "Connecting"
+                        : streamStatus === "reconnecting"
+                          ? "Reconnecting"
+                          : streamStatus === "error"
+                            ? "Stream error"
+                            : "Offline"}
+                  </span>
+                </div>
+
+                <span className="text-xs text-zinc-500">
+                  {orderBook
+                    ? `${orderBook.bids.length} bids · ${orderBook.asks.length} asks`
+                    : "Waiting for data"}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-[1fr_1fr] gap-4">
+                <div className="min-w-0">
+                  <div className="mb-2 flex items-center justify-between border-b border-zinc-800 pb-2">
+                    <span className="text-xs font-semibold uppercase tracking-wider text-red-400">
+                      Asks
+                    </span>
+
+                    <span className="text-[10px] text-zinc-600">
+                      Sell
+                    </span>
+                  </div>
+
+                  <div className="mb-2 grid grid-cols-3 gap-1 text-[10px] text-zinc-600">
+                    <span>Price</span>
+                    <span className="text-right">Amount</span>
+                    <span className="text-right">Total</span>
+                  </div>
+
+                  <div className="space-y-1">
+                    {loadingOrderBook && !orderBook ? (
+                      <p className="py-6 text-center text-xs text-zinc-600">
+                        Loading asks...
+                      </p>
+                    ) : askLevels.length > 0 ? (
+                      askLevels.map((level, index) => (
+                        <div
+                          key={`ask-${level.price}-${index}`}
+                          className="relative grid grid-cols-3 gap-1 overflow-hidden rounded px-1 py-1.5 font-mono text-[11px] sm:text-xs"
+                        >
+                          <div
+                            className="absolute inset-y-0 right-0 bg-red-500/10"
+                            style={{
+                              width: `${level.depthPercent}%`,
+                            }}
+                          />
+
+                          <span className="relative z-10 text-red-400">
+                            {formatNumber(level.price, 1)}
+                          </span>
+
+                          <span className="relative z-10 text-right text-zinc-300">
+                            {formatNumber(level.quantity, 4)}
+                          </span>
+
+                          <span className="relative z-10 text-right text-zinc-500">
+                            {formatNumber(level.cumulative, 4)}
+                          </span>
+                        </div>
+                      ))
+                    ) : (
+                      <p className="py-6 text-center text-xs text-zinc-600">
+                        No ask levels available
+                      </p>
+                    )}
+                  </div>
+                </div>
+
+                <div className="min-w-0">
+                  <div className="mb-2 flex items-center justify-between border-b border-zinc-800 pb-2">
+                    <span className="text-xs font-semibold uppercase tracking-wider text-emerald-400">
+                      Bids
+                    </span>
+
+                    <span className="text-[10px] text-zinc-600">
+                      Buy
+                    </span>
+                  </div>
+
+                  <div className="mb-2 grid grid-cols-3 gap-1 text-[10px] text-zinc-600">
+                    <span>Price</span>
+                    <span className="text-right">Amount</span>
+                    <span className="text-right">Total</span>
+                  </div>
+
+                  <div className="space-y-1">
+                    {loadingOrderBook && !orderBook ? (
+                      <p className="py-6 text-center text-xs text-zinc-600">
+                        Loading bids...
+                      </p>
+                    ) : bidLevels.length > 0 ? (
+                      bidLevels.map((level, index) => (
+                        <div
+                          key={`bid-${level.price}-${index}`}
+                          className="relative grid grid-cols-3 gap-1 overflow-hidden rounded px-1 py-1.5 font-mono text-[11px] sm:text-xs"
+                        >
+                          <div
+                            className="absolute inset-y-0 right-0 bg-emerald-500/10"
+                            style={{
+                              width: `${level.depthPercent}%`,
+                            }}
+                          />
+
+                          <span className="relative z-10 text-emerald-400">
+                            {formatNumber(level.price, 1)}
+                          </span>
+
+                          <span className="relative z-10 text-right text-zinc-300">
+                            {formatNumber(level.quantity, 4)}
+                          </span>
+
+                          <span className="relative z-10 text-right text-zinc-500">
+                            {formatNumber(level.cumulative, 4)}
+                          </span>
+                        </div>
+                      ))
+                    ) : (
+                      <p className="py-6 text-center text-xs text-zinc-600">
+                        No bid levels available
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {orderBook && (
+                <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-zinc-800 pt-3 text-[10px] text-zinc-600">
+                  <span>
+                    Sequence: {orderBook.seq}
+                  </span>
+
+                  <span>
+                    Symbol ID: {orderBook.symbol_id}
+                  </span>
+
+                  <span>
+                    Data time: {new Date(orderBook.time).toLocaleTimeString()}
+                  </span>
+                </div>
+              )}
+            </div>
           </div>
 
           <div className="rounded-2xl border border-zinc-800 bg-zinc-900/70">
@@ -660,7 +792,7 @@ export default function Home() {
             </div>
 
             <div className="divide-y divide-zinc-800">
-              <div className="flex items-center justify-between px-5 py-4">
+              <div className="flex items-center justify-between px-5 py-3">
                 <span className="text-sm text-zinc-500">
                   Trading mode
                 </span>
@@ -670,7 +802,7 @@ export default function Home() {
                 </span>
               </div>
 
-              <div className="flex items-center justify-between px-5 py-4">
+              <div className="flex items-center justify-between px-5 py-3">
                 <span className="text-sm text-zinc-500">
                   Price step
                 </span>
@@ -680,7 +812,7 @@ export default function Home() {
                 </span>
               </div>
 
-              <div className="flex items-center justify-between px-5 py-4">
+              <div className="flex items-center justify-between px-5 py-3">
                 <span className="text-sm text-zinc-500">
                   Quantity step
                 </span>
@@ -690,7 +822,7 @@ export default function Home() {
                 </span>
               </div>
 
-              <div className="flex items-center justify-between px-5 py-4">
+              <div className="flex items-center justify-between px-5 py-3">
                 <span className="text-sm text-zinc-500">
                   Minimum size
                 </span>
@@ -700,7 +832,7 @@ export default function Home() {
                 </span>
               </div>
 
-              <div className="flex items-center justify-between px-5 py-4">
+              <div className="flex items-center justify-between px-5 py-3">
                 <span className="text-sm text-zinc-500">
                   Max leverage
                 </span>
@@ -712,7 +844,7 @@ export default function Home() {
                 </span>
               </div>
 
-              <div className="flex items-center justify-between px-5 py-4">
+              <div className="flex items-center justify-between px-5 py-3">
                 <span className="text-sm text-zinc-500">
                   Default leverage
                 </span>
@@ -723,22 +855,258 @@ export default function Home() {
                     : "—"}
                 </span>
               </div>
+            </div>
+          </div>
+        </section>
 
-              <div className="flex items-center justify-between px-5 py-4">
-                <span className="text-sm text-zinc-500">
-                  Price limit
-                </span>
+        <section className="rounded-2xl border border-zinc-800 bg-zinc-900/70">
+          <div className="border-b border-zinc-800 px-5 py-5">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <p className="text-xs font-medium uppercase tracking-wider text-zinc-500">
+                  TESTNET PREVIEW
+                </p>
 
-                <span className="font-mono text-sm">
-                  {symbol?.price_limit_pct ?? "—"}
-                </span>
+                <h2 className="mt-1 text-xl font-semibold">
+                  Order Preview
+                </h2>
               </div>
+
+              <span className="rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-500">
+                BTC-USDT · 20001
+              </span>
+            </div>
+          </div>
+
+          <div className="grid gap-6 p-5 lg:grid-cols-[1fr_1.4fr]">
+            <div>
+              <p className="mb-3 text-sm font-medium text-zinc-300">
+                Order side
+              </p>
+
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => setOrderSide("buy")}
+                  className={`rounded-lg border px-4 py-3 text-sm font-semibold transition ${
+                    orderSide === "buy"
+                      ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-400"
+                      : "border-zinc-700 bg-zinc-900 text-zinc-500 hover:bg-zinc-800"
+                  }`}
+                >
+                  Buy
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setOrderSide("sell")}
+                  className={`rounded-lg border px-4 py-3 text-sm font-semibold transition ${
+                    orderSide === "sell"
+                      ? "border-red-500/50 bg-red-500/10 text-red-400"
+                      : "border-zinc-700 bg-zinc-900 text-zinc-500 hover:bg-zinc-800"
+                  }`}
+                >
+                  Sell
+                </button>
+              </div>
+
+              <p className="mb-3 mt-6 text-sm font-medium text-zinc-300">
+                Execution mode
+              </p>
+
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setOrderMode("maker");
+                    setPriceMatch("");
+                  }}
+                  className={`rounded-lg border px-4 py-3 text-sm font-semibold transition ${
+                    orderMode === "maker"
+                      ? "border-cyan-500/50 bg-cyan-500/10 text-cyan-300"
+                      : "border-zinc-700 bg-zinc-900 text-zinc-500 hover:bg-zinc-800"
+                  }`}
+                >
+                  Maker
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setOrderMode("taker")}
+                  className={`rounded-lg border px-4 py-3 text-sm font-semibold transition ${
+                    orderMode === "taker"
+                      ? "border-violet-500/50 bg-violet-500/10 text-violet-300"
+                      : "border-zinc-700 bg-zinc-900 text-zinc-500 hover:bg-zinc-800"
+                  }`}
+                >
+                  Taker
+                </button>
+              </div>
+
+              <div className="mt-6 rounded-xl border border-zinc-800 bg-zinc-950/60 p-4">
+                <p className="text-xs font-medium uppercase tracking-wider text-zinc-600">
+                  Integration status
+                </p>
+
+                <p className="mt-2 text-sm leading-6 text-zinc-400">
+                  This is a local preview only. No order is sent to
+                  Ticko Testnet.
+                </p>
+              </div>
+            </div>
+
+            <div className="space-y-5">
+              <div>
+                <label
+                  htmlFor="price-match"
+                  className="mb-2 block text-sm font-medium text-zinc-300"
+                >
+                  Price Match
+                </label>
+
+                <select
+                  id="price-match"
+                  value={priceMatch}
+                  onChange={(event) =>
+                    setPriceMatch(
+                      event.target.value as PriceMatch,
+                    )
+                  }
+                  className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-4 py-3 text-sm text-zinc-200 outline-none transition focus:border-cyan-500"
+                >
+                  <option value="">
+                    No Price Match
+                  </option>
+
+                  {PRICE_MATCH_OPTIONS.map((option) => (
+                    <option key={option} value={option}>
+                      {option}
+                    </option>
+                  ))}
+                </select>
+
+                <p className="mt-2 text-xs text-zinc-600">
+                  {priceMatchSelected
+                    ? "Preview only. This Price Match rule is not sent to Ticko."
+                    : "Preview only. The limit price is not submitted to Ticko."}
+                </p>
+              </div>
+
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div>
+                  <label
+                    htmlFor="order-price"
+                    className="mb-2 block text-sm font-medium text-zinc-300"
+                  >
+                    Price
+                  </label>
+
+                  <input
+                    id="order-price"
+                    type="text"
+                    inputMode="decimal"
+                    value={orderPrice}
+                    onChange={(event) =>
+                      setOrderPrice(event.target.value)
+                    }
+                    disabled={priceMatchSelected}
+                    placeholder={
+                      priceMatchSelected
+                        ? "Price Match preview only"
+                        : "e.g. 80000.0"
+                    }
+                    className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-4 py-3 font-mono text-sm text-zinc-200 outline-none transition placeholder:text-zinc-700 focus:border-cyan-500 disabled:cursor-not-allowed disabled:opacity-50"
+                  />
+                </div>
+
+                <div>
+                  <label
+                    htmlFor="order-quantity"
+                    className="mb-2 block text-sm font-medium text-zinc-300"
+                  >
+                    Quantity
+                  </label>
+
+                  <input
+                    id="order-quantity"
+                    type="text"
+                    inputMode="decimal"
+                    value={orderQuantity}
+                    onChange={(event) =>
+                      setOrderQuantity(event.target.value)
+                    }
+                    placeholder="0.001"
+                    className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-4 py-3 font-mono text-sm text-zinc-200 outline-none transition placeholder:text-zinc-700 focus:border-cyan-500"
+                  />
+                </div>
+              </div>
+
+              <div className="rounded-xl border border-zinc-800 bg-zinc-950/60 p-4">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-zinc-500">
+                    Side
+                  </span>
+
+                  <span
+                    className={`text-sm font-semibold ${
+                      orderSide === "buy"
+                        ? "text-emerald-400"
+                        : "text-red-400"
+                    }`}
+                  >
+                    {orderSide.toUpperCase()}
+                  </span>
+                </div>
+
+                <div className="mt-3 flex items-center justify-between">
+                  <span className="text-sm text-zinc-500">
+                    Mode
+                  </span>
+
+                  <span className="text-sm font-medium text-zinc-300">
+                    {orderMode.toUpperCase()}
+                  </span>
+                </div>
+
+                <div className="mt-3 flex items-center justify-between">
+                  <span className="text-sm text-zinc-500">
+                    Price Match
+                  </span>
+
+                  <span className="font-mono text-sm text-zinc-300">
+                    {priceMatch || "—"}
+                  </span>
+                </div>
+
+                <div className="mt-3 flex items-center justify-between">
+                  <span className="text-sm text-zinc-500">
+                    Quantity
+                  </span>
+
+                  <span className="font-mono text-sm text-zinc-300">
+                    {orderQuantity || "—"}
+                  </span>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                disabled
+                className="w-full rounded-lg bg-cyan-400 px-5 py-3 text-sm font-semibold text-zinc-950 opacity-50"
+              >
+                Order submission unavailable
+              </button>
+
+              <p className="text-center text-xs text-zinc-600">
+                Order submission is disabled. No transaction or order
+                will be created from this screen.
+              </p>
             </div>
           </div>
         </section>
 
         <footer className="mt-8 border-t border-zinc-800 pt-5 text-xs text-zinc-600">
-          FranTicko · Ticko Testnet · Server-side API integration
+          FranTicko · Ticko Testnet · Agent Pioneer Dashboard
         </footer>
       </div>
     </main>
