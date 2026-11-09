@@ -6,6 +6,10 @@ import {
   type TickoStreamStatus,
 } from "../lib/ticko/orderbook-stream";
 import {
+  TickoTradesStream,
+  type TickoPublicTrade,
+} from "../lib/ticko/trades-stream";
+import {
   useCallback,
   useEffect,
   useMemo,
@@ -78,7 +82,7 @@ interface DisplayOrderBookLevel {
   depthPercent: number;
 }
 
-const BTC_USDT_SYMBOL_ID = 20001;
+const DEFAULT_SYMBOL_ID = 20001;
 const USDT_COIN_ID = 1001;
 
 const PRICE_MATCH_OPTIONS = [
@@ -150,12 +154,18 @@ function buildDepthLevels(
 }
 
 export default function Home() {
+  const [symbols, setSymbols] = useState<TickoSymbol[]>([]);
   const [symbol, setSymbol] = useState<TickoSymbol | null>(null);
   const [balance, setBalance] = useState<BalanceData | null>(null);
   const [orderBook, setOrderBook] = useState<OrderBookData | null>(null);
 
   const [streamStatus, setStreamStatus] =
     useState<TickoStreamStatus>("disconnected");
+
+  const [trades, setTrades] = useState<TickoPublicTrade[]>([]);
+  const [tradesStreamStatus, setTradesStreamStatus] =
+    useState<TickoStreamStatus>("disconnected");
+  const [tradesError, setTradesError] = useState("");
 
   const [loadingMarket, setLoadingMarket] = useState(true);
   const [loadingBalance, setLoadingBalance] = useState(true);
@@ -193,17 +203,25 @@ export default function Home() {
         );
       }
 
-      const btcUsdt = result.data.list.find(
-        (item) => item.symbol_id === BTC_USDT_SYMBOL_ID,
+      const tradingSymbols = result.data.list.filter(
+        (item) => item.status === "trading",
       );
 
-      if (!btcUsdt) {
-        throw new Error(
-          "BTC-USDT symbol (20001) was not found.",
-        );
+      if (tradingSymbols.length === 0) {
+        throw new Error("No trading symbols are currently available.");
       }
 
-      setSymbol(btcUsdt);
+      setSymbols(tradingSymbols);
+
+      setSymbol((currentSymbol) =>
+        tradingSymbols.find(
+          (item) => item.symbol_id === currentSymbol?.symbol_id,
+        ) ??
+          tradingSymbols.find(
+            (item) => item.symbol_id === DEFAULT_SYMBOL_ID,
+          ) ??
+          tradingSymbols[0],
+      );
     } catch (error) {
       setMarketError(
         error instanceof Error
@@ -244,47 +262,68 @@ export default function Home() {
     }
   }, []);
 
-  const loadOrderBook = useCallback(async () => {
-    setLoadingOrderBook(true);
-    setOrderBookError("");
+  const loadOrderBook = useCallback(
+    async (symbolId: number, signal: AbortSignal) => {
+      setLoadingOrderBook(true);
+      setOrderBookError("");
 
-    try {
-      const response = await fetch(
-        `/api/ticko/orderbook?symbol_id=${BTC_USDT_SYMBOL_ID}&level=1`,
-        { cache: "no-store" },
-      );
-
-      const result = (await response.json()) as OrderBookResponse;
-
-      if (!response.ok || !result.ok || !result.data) {
-        throw new Error(
-          result.error ?? "Unable to load order book data.",
+      try {
+        const response = await fetch(
+          `/api/ticko/orderbook?symbol_id=${symbolId}&level=1`,
+          { cache: "no-store", signal },
         );
-      }
 
-      setOrderBook(result.data);
-    } catch (error) {
-      setOrderBookError(
-        error instanceof Error
-          ? error.message
-          : "Unable to load order book data.",
-      );
-    } finally {
-      setLoadingOrderBook(false);
-    }
-  }, []);
+        const result = (await response.json()) as OrderBookResponse;
+
+        if (!response.ok || !result.ok || !result.data) {
+          throw new Error(
+            result.error ?? "Unable to load order book data.",
+          );
+        }
+
+        if (result.data.symbol_id === symbolId) {
+          setOrderBook(result.data);
+        }
+      } catch (error) {
+        if (signal.aborted) return;
+
+        setOrderBookError(
+          error instanceof Error
+            ? error.message
+            : "Unable to load order book data.",
+        );
+      } finally {
+        if (!signal.aborted) {
+          setLoadingOrderBook(false);
+        }
+      }
+    },
+    [],
+  );
 
   const refreshAll = useCallback(() => {
     void loadMarket();
     void loadBalance();
-    void loadOrderBook();
-  }, [loadBalance, loadMarket, loadOrderBook]);
+  }, [loadBalance, loadMarket]);
 
   useEffect(() => {
     void Promise.resolve().then(refreshAll);
   }, [refreshAll]);
 
-  // Start the public Ticko WebSocket stream after the market is loaded.
+  // Load a REST snapshot for the currently selected symbol.
+  useEffect(() => {
+    if (!symbol) return;
+
+    const controller = new AbortController();
+
+    void loadOrderBook(symbol.symbol_id, controller.signal);
+
+    return () => {
+      controller.abort();
+    };
+  }, [symbol, loadOrderBook]);
+
+  // Start the public Ticko Order Book stream after the market is loaded.
   useEffect(() => {
     if (!symbol) return;
 
@@ -324,6 +363,33 @@ export default function Home() {
     };
   }, [symbol]);
 
+  // Start the independent public Ticko trade stream.
+  useEffect(() => {
+    if (!symbol) return;
+
+    setTrades([]);
+    setTradesError("");
+
+    const stream = new TickoTradesStream(symbol.symbol_id, {
+      onTrades: (nextTrades) => {
+        setTrades(nextTrades);
+        setTradesError("");
+      },
+      onStatus: (status) => {
+        setTradesStreamStatus(status);
+      },
+      onError: (error) => {
+        setTradesError(error);
+      },
+    });
+
+    stream.start();
+
+    return () => {
+      stream.stop();
+    };
+  }, [symbol]);
+
   const usdtBalance = useMemo(() => {
     return (
       balance?.coins.find(
@@ -339,6 +405,7 @@ export default function Home() {
     if (!bestBid || !bestAsk) return null;
 
     const difference = Number(bestAsk[0]) - Number(bestBid[0]);
+
     return Number.isFinite(difference) ? difference : null;
   }, [bestAsk, bestBid]);
 
@@ -366,6 +433,26 @@ export default function Home() {
     Boolean(balance);
 
   const priceMatchSelected = priceMatch !== "";
+
+  const selectedSymbolLabel = symbol
+    ? `Symbol #${symbol.symbol_id}`
+    : "No symbol selected";
+
+  const baseCoinLabel = symbol
+    ? `Base Coin #${symbol.base_coin_id}`
+    : "Base Coin —";
+
+  const quoteCoinLabel = symbol
+    ? `Quote Coin #${symbol.quote_coin_id}`
+    : "Quote Coin —";
+
+  const priceUnitLabel = symbol
+    ? `Quote #${symbol.quote_coin_id}`
+    : "Quote —";
+
+  const quantityUnitLabel = symbol
+    ? `Base #${symbol.base_coin_id}`
+    : "Base —";
 
   return (
     <main className="min-h-screen bg-zinc-950 text-zinc-100">
@@ -499,15 +586,48 @@ export default function Home() {
 
         <section className="mb-6 grid gap-6 lg:grid-cols-[1.5fr_1fr]">
           <div className="rounded-2xl border border-zinc-800 bg-zinc-900/70">
-            <div className="flex items-center justify-between border-b border-zinc-800 px-5 py-4">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-800 px-5 py-4">
               <div>
                 <p className="text-xs font-medium uppercase tracking-wider text-zinc-500">
                   Market
                 </p>
 
-                <h2 className="mt-1 text-lg font-semibold">
-                  BTC-USDT
-                </h2>
+                <div className="mt-2 flex flex-wrap items-center gap-3">
+                  <h2 className="text-lg font-semibold">
+                    {symbol ? `Symbol #${symbol.symbol_id}` : "Loading symbol..."}
+                  </h2>
+
+                  <select
+                    aria-label="Select trading symbol"
+                    value={symbol ? String(symbol.symbol_id) : ""}
+                    onChange={(event) => {
+                      const selectedSymbol = symbols.find(
+                        (item) => item.symbol_id === Number(event.target.value),
+                      );
+
+                      if (selectedSymbol) {
+                        setSymbol(selectedSymbol);
+                      }
+                    }}
+                    disabled={loadingMarket || symbols.length === 0}
+                    className="rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-200 outline-none transition focus:border-cyan-500 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {symbols.map((item) => (
+                      <option key={item.symbol_id} value={item.symbol_id}>
+                        {`Symbol #${item.symbol_id} · Base ${item.base_coin_id} / Quote ${item.quote_coin_id}`}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
+                  <span className="rounded-md border border-cyan-900/60 bg-cyan-950/30 px-2 py-1 text-cyan-300">
+                    {baseCoinLabel}
+                  </span>
+                  <span className="rounded-md border border-violet-900/60 bg-violet-950/30 px-2 py-1 text-violet-300">
+                    {quoteCoinLabel}
+                  </span>
+                </div>
               </div>
 
               {symbol && (
@@ -533,13 +653,17 @@ export default function Home() {
                   {loadingOrderBook
                     ? "Loading..."
                     : bestBid
-                      ? formatNumber(bestBid[0], 1)
+                      ? formatNumber(bestBid[0], symbol?.price_precision ?? 4)
                       : "—"}
                 </p>
 
                 <p className="mt-1 text-xs text-zinc-500">
+                  Price in {priceUnitLabel}
+                </p>
+
+                <p className="mt-1 text-xs text-zinc-500">
                   {bestBid
-                    ? `Size: ${formatNumber(bestBid[1], 4)} BTC`
+                    ? `Quantity: ${formatNumber(bestBid[1], symbol?.qty_precision ?? 4)} ${quantityUnitLabel}`
                     : "Best available buy price"}
                 </p>
               </div>
@@ -553,13 +677,17 @@ export default function Home() {
                   {loadingOrderBook
                     ? "Loading..."
                     : bestAsk
-                      ? formatNumber(bestAsk[0], 1)
+                      ? formatNumber(bestAsk[0], symbol?.price_precision ?? 4)
                       : "—"}
                 </p>
 
                 <p className="mt-1 text-xs text-zinc-500">
+                  Price in {priceUnitLabel}
+                </p>
+
+                <p className="mt-1 text-xs text-zinc-500">
                   {bestAsk
-                    ? `Size: ${formatNumber(bestAsk[1], 4)} BTC`
+                    ? `Quantity: ${formatNumber(bestAsk[1], symbol?.qty_precision ?? 4)} ${quantityUnitLabel}`
                     : "Best available sell price"}
                 </p>
               </div>
@@ -567,7 +695,7 @@ export default function Home() {
 
             <div className="flex flex-wrap items-center justify-between gap-2 border-t border-zinc-800 px-5 py-3">
               <span className="text-xs text-zinc-500">
-                Spread: {spread === null ? "—" : `${formatNumber(spread, 1)} USDT`}
+                Spread: {spread === null ? "—" : `${formatNumber(spread, symbol?.price_precision ?? 4)} ${priceUnitLabel}`}
               </span>
 
               <span className="text-xs text-zinc-600">
@@ -596,53 +724,50 @@ export default function Home() {
             )}
 
             <div className="border-t border-zinc-800 px-5 py-4">
-              <div className="mb-4 flex items-center justify-between">
-                <div className="flex items-center gap-2">
+              <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+                <div>
                   <h3 className="text-sm font-semibold text-zinc-200">
                     Market Depth
                   </h3>
-
-                  <span
-                    className={`inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-[10px] font-medium ${
-                      streamStatus === "connected"
-                        ? "bg-emerald-400/10 text-emerald-400"
-                        : streamStatus === "connecting" ||
-                            streamStatus === "reconnecting"
-                          ? "bg-amber-400/10 text-amber-400"
-                          : streamStatus === "error"
-                            ? "bg-red-400/10 text-red-400"
-                            : "bg-zinc-800 text-zinc-500"
-                    }`}
-                  >
-                    <span
-                      className={`h-1.5 w-1.5 rounded-full ${
-                        streamStatus === "connected"
-                          ? "bg-emerald-400"
-                          : streamStatus === "connecting" ||
-                              streamStatus === "reconnecting"
-                            ? "bg-amber-400"
-                            : streamStatus === "error"
-                              ? "bg-red-400"
-                              : "bg-zinc-500"
-                      }`}
-                    />
-
-                    {streamStatus === "connected"
-                      ? "Live"
-                      : streamStatus === "connecting"
-                        ? "Connecting"
-                        : streamStatus === "reconnecting"
-                          ? "Reconnecting"
-                          : streamStatus === "error"
-                            ? "Stream error"
-                            : "Offline"}
-                  </span>
+                  <p className="mt-1 text-[11px] text-zinc-500">
+                    {selectedSymbolLabel} · Price: {priceUnitLabel} · Quantity: {quantityUnitLabel}
+                  </p>
                 </div>
 
-                <span className="text-xs text-zinc-500">
-                  {orderBook
-                    ? `${orderBook.bids.length} bids · ${orderBook.asks.length} asks`
-                    : "Waiting for data"}
+                <span
+                  className={`inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-[10px] font-medium ${
+                    streamStatus === "connected"
+                      ? "bg-emerald-400/10 text-emerald-400"
+                      : streamStatus === "connecting" ||
+                          streamStatus === "reconnecting"
+                        ? "bg-amber-400/10 text-amber-400"
+                        : streamStatus === "error"
+                          ? "bg-red-400/10 text-red-400"
+                          : "bg-zinc-800 text-zinc-500"
+                  }`}
+                >
+                  <span
+                    className={`h-1.5 w-1.5 rounded-full ${
+                      streamStatus === "connected"
+                        ? "bg-emerald-400"
+                        : streamStatus === "connecting" ||
+                            streamStatus === "reconnecting"
+                          ? "bg-amber-400"
+                          : streamStatus === "error"
+                            ? "bg-red-400"
+                            : "bg-zinc-500"
+                    }`}
+                  />
+
+                  {streamStatus === "connected"
+                    ? "Live"
+                    : streamStatus === "connecting"
+                      ? "Connecting"
+                      : streamStatus === "reconnecting"
+                        ? "Reconnecting"
+                        : streamStatus === "error"
+                          ? "Stream error"
+                          : "Offline"}
                 </span>
               </div>
 
@@ -659,9 +784,9 @@ export default function Home() {
                   </div>
 
                   <div className="mb-2 grid grid-cols-3 gap-1 text-[10px] text-zinc-600">
-                    <span>Price</span>
-                    <span className="text-right">Amount</span>
-                    <span className="text-right">Total</span>
+                    <span>Price ({priceUnitLabel})</span>
+                    <span className="text-right">Amount ({quantityUnitLabel})</span>
+                    <span className="text-right">Total ({quantityUnitLabel})</span>
                   </div>
 
                   <div className="space-y-1">
@@ -683,15 +808,15 @@ export default function Home() {
                           />
 
                           <span className="relative z-10 text-red-400">
-                            {formatNumber(level.price, 1)}
+                            {formatNumber(level.price, symbol?.price_precision ?? 4)}
                           </span>
 
                           <span className="relative z-10 text-right text-zinc-300">
-                            {formatNumber(level.quantity, 4)}
+                            {formatNumber(level.quantity, symbol?.qty_precision ?? 4)}
                           </span>
 
                           <span className="relative z-10 text-right text-zinc-500">
-                            {formatNumber(level.cumulative, 4)}
+                            {formatNumber(level.cumulative, symbol?.qty_precision ?? 4)}
                           </span>
                         </div>
                       ))
@@ -715,9 +840,9 @@ export default function Home() {
                   </div>
 
                   <div className="mb-2 grid grid-cols-3 gap-1 text-[10px] text-zinc-600">
-                    <span>Price</span>
-                    <span className="text-right">Amount</span>
-                    <span className="text-right">Total</span>
+                    <span>Price ({priceUnitLabel})</span>
+                    <span className="text-right">Amount ({quantityUnitLabel})</span>
+                    <span className="text-right">Total ({quantityUnitLabel})</span>
                   </div>
 
                   <div className="space-y-1">
@@ -739,15 +864,15 @@ export default function Home() {
                           />
 
                           <span className="relative z-10 text-emerald-400">
-                            {formatNumber(level.price, 1)}
+                            {formatNumber(level.price, symbol?.price_precision ?? 4)}
                           </span>
 
                           <span className="relative z-10 text-right text-zinc-300">
-                            {formatNumber(level.quantity, 4)}
+                            {formatNumber(level.quantity, symbol?.qty_precision ?? 4)}
                           </span>
 
                           <span className="relative z-10 text-right text-zinc-500">
-                            {formatNumber(level.cumulative, 4)}
+                            {formatNumber(level.cumulative, symbol?.qty_precision ?? 4)}
                           </span>
                         </div>
                       ))
@@ -789,9 +914,58 @@ export default function Home() {
                   ? `Symbol #${symbol.symbol_id}`
                   : "Loading..."}
               </h2>
+
+              <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
+                <span className="rounded-md border border-cyan-900/60 bg-cyan-950/30 px-2 py-1 text-cyan-300">
+                  {baseCoinLabel}
+                </span>
+                <span className="rounded-md border border-violet-900/60 bg-violet-950/30 px-2 py-1 text-violet-300">
+                  {quoteCoinLabel}
+                </span>
+              </div>
             </div>
 
             <div className="divide-y divide-zinc-800">
+              <div className="flex items-center justify-between px-5 py-3">
+                <span className="text-sm text-zinc-500">
+                  Symbol ID
+                </span>
+
+                <span className="font-mono text-sm">
+                  {symbol?.symbol_id ?? "—"}
+                </span>
+              </div>
+
+              <div className="flex items-center justify-between px-5 py-3">
+                <span className="text-sm text-zinc-500">
+                  Base Coin ID
+                </span>
+
+                <span className="font-mono text-sm">
+                  {symbol?.base_coin_id ?? "—"}
+                </span>
+              </div>
+
+              <div className="flex items-center justify-between px-5 py-3">
+                <span className="text-sm text-zinc-500">
+                  Quote Coin ID
+                </span>
+
+                <span className="font-mono text-sm">
+                  {symbol?.quote_coin_id ?? "—"}
+                </span>
+              </div>
+
+              <div className="flex items-center justify-between px-5 py-3">
+                <span className="text-sm text-zinc-500">
+                  Trading status
+                </span>
+
+                <span className="text-sm font-medium">
+                  {symbol?.status ?? "—"}
+                </span>
+              </div>
+
               <div className="flex items-center justify-between px-5 py-3">
                 <span className="text-sm text-zinc-500">
                   Trading mode
@@ -799,6 +973,26 @@ export default function Home() {
 
                 <span className="text-sm font-medium">
                   {symbol?.trading_mode ?? "—"}
+                </span>
+              </div>
+
+              <div className="flex items-center justify-between px-5 py-3">
+                <span className="text-sm text-zinc-500">
+                  Price precision
+                </span>
+
+                <span className="font-mono text-sm">
+                  {symbol?.price_precision ?? "—"}
+                </span>
+              </div>
+
+              <div className="flex items-center justify-between px-5 py-3">
+                <span className="text-sm text-zinc-500">
+                  Quantity precision
+                </span>
+
+                <span className="font-mono text-sm">
+                  {symbol?.qty_precision ?? "—"}
                 </span>
               </div>
 
@@ -834,6 +1028,16 @@ export default function Home() {
 
               <div className="flex items-center justify-between px-5 py-3">
                 <span className="text-sm text-zinc-500">
+                  Maximum size
+                </span>
+
+                <span className="font-mono text-sm">
+                  {symbol?.max_size ?? "—"}
+                </span>
+              </div>
+
+              <div className="flex items-center justify-between px-5 py-3">
+                <span className="text-sm text-zinc-500">
                   Max leverage
                 </span>
 
@@ -855,7 +1059,146 @@ export default function Home() {
                     : "—"}
                 </span>
               </div>
+
+              <div className="flex items-center justify-between px-5 py-3">
+                <span className="text-sm text-zinc-500">
+                  Price limit (%)
+                </span>
+
+                <span className="font-mono text-sm">
+                  {symbol?.price_limit_pct ?? "—"}
+                </span>
+              </div>
             </div>
+          </div>
+        </section>
+
+        {/* Live Trades */}
+        <section className="mb-6 rounded-2xl border border-zinc-800 bg-zinc-900/70">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-800 px-5 py-4">
+            <div>
+              <p className="text-xs font-medium uppercase tracking-wider text-zinc-500">
+                Market Activity
+              </p>
+
+              <h2 className="mt-1 text-lg font-semibold">
+                Live Trades
+              </h2>
+
+              <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
+                <span className="rounded-md border border-zinc-700 bg-zinc-950 px-2 py-1 text-zinc-300">
+                  {selectedSymbolLabel}
+                </span>
+                <span className="rounded-md border border-cyan-900/60 bg-cyan-950/30 px-2 py-1 text-cyan-300">
+                  Price: {priceUnitLabel}
+                </span>
+                <span className="rounded-md border border-violet-900/60 bg-violet-950/30 px-2 py-1 text-violet-300">
+                  Quantity: {quantityUnitLabel}
+                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 rounded-full border border-zinc-800 bg-zinc-950 px-3 py-1.5 text-xs">
+              <span
+                className={`h-2 w-2 rounded-full ${
+                  tradesStreamStatus === "connected"
+                    ? "bg-emerald-400"
+                    : tradesStreamStatus === "connecting" ||
+                        tradesStreamStatus === "reconnecting"
+                      ? "bg-amber-400"
+                      : tradesStreamStatus === "error"
+                        ? "bg-red-400"
+                        : "bg-zinc-500"
+                }`}
+              />
+
+              <span className="text-zinc-300">
+                {tradesStreamStatus === "connected"
+                  ? "Live"
+                  : tradesStreamStatus === "connecting"
+                    ? "Connecting"
+                    : tradesStreamStatus === "reconnecting"
+                      ? "Reconnecting"
+                      : tradesStreamStatus === "error"
+                        ? "Stream error"
+                        : "Offline"}
+              </span>
+            </div>
+          </div>
+
+          {tradesError && (
+            <div className="border-b border-zinc-800 px-5 py-3">
+              <p className="text-xs text-red-400">
+                {tradesError}
+              </p>
+            </div>
+          )}
+
+          <div className="overflow-x-auto">
+            <div className="min-w-[620px]">
+              <div className="grid grid-cols-[1.2fr_1fr_1fr_1fr_1fr] gap-3 border-b border-zinc-800 px-5 py-3 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                <span>Price (Quote #{symbol?.quote_coin_id ?? "—"})</span>
+                <span className="text-right">Quantity (Base #{symbol?.base_coin_id ?? "—"})</span>
+                <span className="text-right">Amount (Quote #{symbol?.quote_coin_id ?? "—"})</span>
+                <span className="text-right">Time</span>
+                <span className="text-right">Trade ID</span>
+              </div>
+
+              {trades.length > 0 ? (
+                <div className="divide-y divide-zinc-800/70">
+                  {trades.map((trade, index) => (
+                    <div
+                      key={`${trade.tradeId}-${index}`}
+                      className="grid grid-cols-[1.2fr_1fr_1fr_1fr_1fr] items-center gap-3 px-5 py-3 font-mono text-xs"
+                    >
+                      <span className="font-semibold text-zinc-100">
+                        {formatNumber(trade.price, symbol?.price_precision ?? 4)}
+                      </span>
+
+                      <span className="text-right text-zinc-300">
+                        {formatNumber(trade.quantity, symbol?.qty_precision ?? 4)}
+                      </span>
+
+                      <span className="text-right text-zinc-300">
+                        {formatNumber(trade.amount, 2)}
+                      </span>
+
+                      <span className="text-right text-zinc-400">
+                        {new Date(trade.time).toLocaleTimeString()}
+                      </span>
+
+                      <span
+                        className="text-right text-zinc-500"
+                        title={trade.tradeId}
+                      >
+                        {trade.tradeId.length > 12
+                          ? `${trade.tradeId.slice(0, 8)}…`
+                          : trade.tradeId}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="px-5 py-10 text-center text-sm text-zinc-600">
+                  {tradesStreamStatus === "connecting" ||
+                  tradesStreamStatus === "reconnecting"
+                    ? "Waiting for live trades..."
+                    : tradesStreamStatus === "error"
+                      ? "Live trades are currently unavailable."
+                      : "No trades received yet."}
+                </p>
+              )}
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-zinc-800 px-5 py-3 text-[10px] text-zinc-600">
+            <span>
+              {selectedSymbolLabel} · Base #{symbol?.base_coin_id ?? "—"} / Quote #{symbol?.quote_coin_id ?? "—"}
+            </span>
+
+            <span>
+              {trades.length} / 50 recent trades
+            </span>
           </div>
         </section>
 
@@ -872,8 +1215,8 @@ export default function Home() {
                 </h2>
               </div>
 
-              <span className="rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-500">
-                BTC-USDT · 20001
+              <span className="rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-300">
+                {selectedSymbolLabel} · Base #{symbol?.base_coin_id ?? "—"} / Quote #{symbol?.quote_coin_id ?? "—"}
               </span>
             </div>
           </div>
@@ -998,7 +1341,7 @@ export default function Home() {
                     htmlFor="order-price"
                     className="mb-2 block text-sm font-medium text-zinc-300"
                   >
-                    Price
+                    Price ({priceUnitLabel})
                   </label>
 
                   <input
@@ -1013,7 +1356,7 @@ export default function Home() {
                     placeholder={
                       priceMatchSelected
                         ? "Price Match preview only"
-                        : "e.g. 80000.0"
+                        : "Enter price"
                     }
                     className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-4 py-3 font-mono text-sm text-zinc-200 outline-none transition placeholder:text-zinc-700 focus:border-cyan-500 disabled:cursor-not-allowed disabled:opacity-50"
                   />
@@ -1024,7 +1367,7 @@ export default function Home() {
                     htmlFor="order-quantity"
                     className="mb-2 block text-sm font-medium text-zinc-300"
                   >
-                    Quantity
+                    Quantity ({quantityUnitLabel})
                   </label>
 
                   <input
@@ -1043,6 +1386,26 @@ export default function Home() {
 
               <div className="rounded-xl border border-zinc-800 bg-zinc-950/60 p-4">
                 <div className="flex items-center justify-between">
+                  <span className="text-sm text-zinc-500">
+                    Selected market
+                  </span>
+
+                  <span className="text-sm font-semibold text-zinc-200">
+                    {selectedSymbolLabel}
+                  </span>
+                </div>
+
+                <div className="mt-3 flex items-center justify-between">
+                  <span className="text-sm text-zinc-500">
+                    Base / Quote
+                  </span>
+
+                  <span className="text-sm font-medium text-zinc-300">
+                    #{symbol?.base_coin_id ?? "—"} / #{symbol?.quote_coin_id ?? "—"}
+                  </span>
+                </div>
+
+                <div className="mt-3 flex items-center justify-between">
                   <span className="text-sm text-zinc-500">
                     Side
                   </span>
@@ -1080,11 +1443,21 @@ export default function Home() {
 
                 <div className="mt-3 flex items-center justify-between">
                   <span className="text-sm text-zinc-500">
+                    Price
+                  </span>
+
+                  <span className="font-mono text-sm text-zinc-300">
+                    {orderPrice || "—"} {priceUnitLabel}
+                  </span>
+                </div>
+
+                <div className="mt-3 flex items-center justify-between">
+                  <span className="text-sm text-zinc-500">
                     Quantity
                   </span>
 
                   <span className="font-mono text-sm text-zinc-300">
-                    {orderQuantity || "—"}
+                    {orderQuantity || "—"} {quantityUnitLabel}
                   </span>
                 </div>
               </div>
