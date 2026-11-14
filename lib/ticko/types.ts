@@ -67,6 +67,24 @@ export interface TickoSymbolsData {
   list: TickoSymbol[];
 }
 
+/** A single coin in the market reference data. */
+export interface TickoRefDataCoin {
+  coin: string;
+  coin_id: number;
+}
+
+/** A single trading symbol in the market reference data. */
+export interface TickoRefDataSymbol {
+  symbol: string;
+  symbol_id: number;
+}
+
+/** Payload of GET /market/ref-data. */
+export interface TickoRefDataData {
+  coins: Record<string, TickoRefDataCoin>;
+  symbols: Record<string, TickoRefDataSymbol>;
+}
+
 /** A single coin balance. */
 export interface TickoBalanceCoin {
   coin_id: number;

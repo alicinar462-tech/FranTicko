@@ -1,3 +1,4 @@
+
 "use client";
 
 import Image from "next/image";
@@ -31,6 +32,27 @@ interface TickoSymbol {
   max_leverage: number | null;
   default_leverage: number | null;
   price_limit_pct: string | null;
+}
+
+interface RefDataCoin {
+  coin: string;
+  coin_id: number;
+}
+
+interface RefDataSymbol {
+  symbol: string;
+  symbol_id: number;
+}
+
+interface RefDataData {
+  coins: Record<string, RefDataCoin>;
+  symbols: Record<string, RefDataSymbol>;
+}
+
+interface RefDataResponse {
+  ok: boolean;
+  data?: RefDataData;
+  error?: string;
 }
 
 interface BalanceCoin {
@@ -156,6 +178,7 @@ function buildDepthLevels(
 export default function Home() {
   const [symbols, setSymbols] = useState<TickoSymbol[]>([]);
   const [symbol, setSymbol] = useState<TickoSymbol | null>(null);
+  const [refData, setRefData] = useState<RefDataData | null>(null);
   const [balance, setBalance] = useState<BalanceData | null>(null);
   const [orderBook, setOrderBook] = useState<OrderBookData | null>(null);
 
@@ -201,6 +224,25 @@ export default function Home() {
         throw new Error(
           result.error ?? "Unable to load market data.",
         );
+      }
+
+      // Reference data supplies human-readable coin and market names.
+      // If it is temporarily unavailable, the dashboard keeps working
+      // with the existing ID-based fallback labels.
+      try {
+        const refResponse = await fetch("/api/ticko/ref-data", {
+          cache: "no-store",
+        });
+
+        const refResult = (await refResponse.json()) as RefDataResponse;
+
+        if (refResponse.ok && refResult.ok && refResult.data) {
+          setRefData(refResult.data);
+        } else {
+          setRefData(null);
+        }
+      } catch {
+        setRefData(null);
       }
 
       const tradingSymbols = result.data.list.filter(
@@ -434,24 +476,33 @@ export default function Home() {
 
   const priceMatchSelected = priceMatch !== "";
 
+  const baseCoinName = symbol
+    ? refData?.coins[String(symbol.base_coin_id)]?.coin
+    : undefined;
+
+  const quoteCoinName = symbol
+    ? refData?.coins[String(symbol.quote_coin_id)]?.coin
+    : undefined;
+
   const selectedSymbolLabel = symbol
-    ? `Symbol #${symbol.symbol_id}`
+    ? refData?.symbols[String(symbol.symbol_id)]?.symbol ??
+      `Symbol #${symbol.symbol_id}`
     : "No symbol selected";
 
   const baseCoinLabel = symbol
-    ? `Base Coin #${symbol.base_coin_id}`
+    ? `Base: ${baseCoinName ?? `#${symbol.base_coin_id}`}`
     : "Base Coin —";
 
   const quoteCoinLabel = symbol
-    ? `Quote Coin #${symbol.quote_coin_id}`
+    ? `Quote: ${quoteCoinName ?? `#${symbol.quote_coin_id}`}`
     : "Quote Coin —";
 
   const priceUnitLabel = symbol
-    ? `Quote #${symbol.quote_coin_id}`
+    ? quoteCoinName ?? `Quote #${symbol.quote_coin_id}`
     : "Quote —";
 
   const quantityUnitLabel = symbol
-    ? `Base #${symbol.base_coin_id}`
+    ? baseCoinName ?? `Base #${symbol.base_coin_id}`
     : "Base —";
 
   return (
@@ -594,7 +645,7 @@ export default function Home() {
 
                 <div className="mt-2 flex flex-wrap items-center gap-3">
                   <h2 className="text-lg font-semibold">
-                    {symbol ? `Symbol #${symbol.symbol_id}` : "Loading symbol..."}
+                    {symbol ? selectedSymbolLabel : "Loading symbol..."}
                   </h2>
 
                   <select
@@ -614,7 +665,7 @@ export default function Home() {
                   >
                     {symbols.map((item) => (
                       <option key={item.symbol_id} value={item.symbol_id}>
-                        {`Symbol #${item.symbol_id} · Base ${item.base_coin_id} / Quote ${item.quote_coin_id}`}
+                        {`${refData?.symbols[String(item.symbol_id)]?.symbol ?? `Symbol #${item.symbol_id}`} · ${refData?.coins[String(item.base_coin_id)]?.coin ?? `#${item.base_coin_id}`} / ${refData?.coins[String(item.quote_coin_id)]?.coin ?? `#${item.quote_coin_id}`}`}
                       </option>
                     ))}
                   </select>
@@ -910,9 +961,7 @@ export default function Home() {
               </p>
 
               <h2 className="mt-1 text-lg font-semibold">
-                {symbol
-                  ? `Symbol #${symbol.symbol_id}`
-                  : "Loading..."}
+                {symbol ? selectedSymbolLabel : "Loading..."}
               </h2>
 
               <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
@@ -942,7 +991,9 @@ export default function Home() {
                 </span>
 
                 <span className="font-mono text-sm">
-                  {symbol?.base_coin_id ?? "—"}
+                  {symbol
+                    ? `${baseCoinName ?? "Unknown"} (#${symbol.base_coin_id})`
+                    : "—"}
                 </span>
               </div>
 
@@ -952,7 +1003,9 @@ export default function Home() {
                 </span>
 
                 <span className="font-mono text-sm">
-                  {symbol?.quote_coin_id ?? "—"}
+                  {symbol
+                    ? `${quoteCoinName ?? "Unknown"} (#${symbol.quote_coin_id})`
+                    : "—"}
                 </span>
               </div>
 
@@ -1137,9 +1190,9 @@ export default function Home() {
           <div className="overflow-x-auto">
             <div className="min-w-[620px]">
               <div className="grid grid-cols-[1.2fr_1fr_1fr_1fr_1fr] gap-3 border-b border-zinc-800 px-5 py-3 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
-                <span>Price (Quote #{symbol?.quote_coin_id ?? "—"})</span>
-                <span className="text-right">Quantity (Base #{symbol?.base_coin_id ?? "—"})</span>
-                <span className="text-right">Amount (Quote #{symbol?.quote_coin_id ?? "—"})</span>
+                <span>Price ({priceUnitLabel})</span>
+                <span className="text-right">Quantity ({quantityUnitLabel})</span>
+                <span className="text-right">Amount ({priceUnitLabel})</span>
                 <span className="text-right">Time</span>
                 <span className="text-right">Trade ID</span>
               </div>
@@ -1193,7 +1246,7 @@ export default function Home() {
 
           <div className="flex flex-wrap items-center justify-between gap-2 border-t border-zinc-800 px-5 py-3 text-[10px] text-zinc-600">
             <span>
-              {selectedSymbolLabel} · Base #{symbol?.base_coin_id ?? "—"} / Quote #{symbol?.quote_coin_id ?? "—"}
+              {selectedSymbolLabel} · {baseCoinLabel} / {quoteCoinLabel}
             </span>
 
             <span>
@@ -1216,7 +1269,7 @@ export default function Home() {
               </div>
 
               <span className="rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-300">
-                {selectedSymbolLabel} · Base #{symbol?.base_coin_id ?? "—"} / Quote #{symbol?.quote_coin_id ?? "—"}
+                {selectedSymbolLabel} · {baseCoinLabel} / {quoteCoinLabel}
               </span>
             </div>
           </div>
@@ -1401,7 +1454,7 @@ export default function Home() {
                   </span>
 
                   <span className="text-sm font-medium text-zinc-300">
-                    #{symbol?.base_coin_id ?? "—"} / #{symbol?.quote_coin_id ?? "—"}
+                    {baseCoinName ?? `#${symbol?.base_coin_id ?? "—"}`} / {quoteCoinName ?? `#${symbol?.quote_coin_id ?? "—"}`}
                   </span>
                 </div>
 

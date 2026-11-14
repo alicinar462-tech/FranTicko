@@ -9,6 +9,7 @@ import type {
   TickoOrderBookData,
   TickoPlaceOrderData,
   TickoPlaceOrderFields,
+  TickoRefDataData,
   TickoSymbolsData,
 } from "./types";
 
@@ -68,6 +69,66 @@ export async function getSymbols(
   if (envelope.code !== "0") {
     throw new Error(
       `Ticko GET /market/symbols failed (code=${envelope.code}, msg=${envelope.msg}, trace_code=${envelope.trace_code})`,
+    );
+  }
+
+  return envelope.data;
+}
+
+/** Options for GET /market/ref-data. */
+export interface GetRefDataOptions {
+  signal?: AbortSignal;
+}
+
+/**
+ * Fetch coin and trading-pair reference data from Ticko.
+ *
+ * GET /market/ref-data — public read endpoint.
+ * No authentication or signing is required.
+ */
+export async function getRefData(
+  options: GetRefDataOptions = {},
+): Promise<TickoRefDataData> {
+  const url = `${getBaseUrl()}/market/ref-data`;
+
+  let response: Response;
+
+  try {
+    response = await fetch(url, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      signal: options.signal,
+    });
+  } catch (error) {
+    throw new Error(
+      `Ticko GET /market/ref-data network error: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+
+  if (!response.ok) {
+    const bodyText = await response.text().catch(() => "");
+    throw new Error(
+      `Ticko GET /market/ref-data failed with HTTP ${response.status}${
+        bodyText ? `: ${bodyText}` : ""
+      }`,
+    );
+  }
+
+  let envelope: TickoEnvelope<TickoRefDataData>;
+
+  try {
+    envelope = (await response.json()) as TickoEnvelope<TickoRefDataData>;
+  } catch {
+    throw new Error(
+      "Ticko GET /market/ref-data returned a non-JSON response.",
+    );
+  }
+
+  if (envelope.code !== "0") {
+    throw new Error(
+      `Ticko GET /market/ref-data failed (code=${envelope.code}, msg=${envelope.msg}, trace_code=${envelope.trace_code})`,
     );
   }
 
