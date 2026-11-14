@@ -1,4 +1,3 @@
-
 "use client";
 
 import Image from "next/image";
@@ -306,9 +305,6 @@ export default function Home() {
 
   const loadOrderBook = useCallback(
     async (symbolId: number, signal: AbortSignal) => {
-      setLoadingOrderBook(true);
-      setOrderBookError("");
-
       try {
         const response = await fetch(
           `/api/ticko/orderbook?symbol_id=${symbolId}&level=1`,
@@ -358,7 +354,9 @@ export default function Home() {
 
     const controller = new AbortController();
 
-    void loadOrderBook(symbol.symbol_id, controller.signal);
+    void Promise.resolve().then(() =>
+      loadOrderBook(symbol.symbol_id, controller.signal),
+    );
 
     return () => {
       controller.abort();
@@ -391,6 +389,7 @@ export default function Home() {
         if (status !== "connected") {
           setOrderBook(null);
           setLoadingOrderBook(true);
+          setOrderBookError("");
         }
       },
       onError: (error) => {
@@ -408,9 +407,6 @@ export default function Home() {
   // Start the independent public Ticko trade stream.
   useEffect(() => {
     if (!symbol) return;
-
-    setTrades([]);
-    setTradesError("");
 
     const stream = new TickoTradesStream(symbol.symbol_id, {
       onTrades: (nextTrades) => {
@@ -657,6 +653,8 @@ export default function Home() {
                       );
 
                       if (selectedSymbol) {
+                        setTrades([]);
+                        setTradesError("");
                         setSymbol(selectedSymbol);
                       }
                     }}
