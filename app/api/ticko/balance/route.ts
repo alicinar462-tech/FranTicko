@@ -1,20 +1,34 @@
+
+import { isAddress } from "viem";
 import { getBalance } from "@/lib/ticko/client";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET() {
-  const address = process.env.TICKO_ACCOUNT_ADDRESS?.trim().toLowerCase();
+  const rawAddress = process.env.TICKO_ACCOUNT_ADDRESS?.trim();
 
-  if (!address) {
+  if (!rawAddress) {
     return Response.json(
       {
         ok: false,
-        error: "TICKO_ACCOUNT_ADDRESS is not configured.",
+        error: "Ticko account address is not configured.",
       },
       { status: 500 },
     );
   }
+
+  if (!isAddress(rawAddress, { strict: false })) {
+    return Response.json(
+      {
+        ok: false,
+        error: "Configured Ticko account address is invalid.",
+      },
+      { status: 500 },
+    );
+  }
+
+  const address = rawAddress.toLowerCase();
 
   try {
     const data = await getBalance(address);

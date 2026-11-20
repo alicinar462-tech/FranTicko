@@ -1,48 +1,67 @@
 # FranTicko
 
-A [Next.js](https://nextjs.org) project built with TypeScript and the App
-Router. This repository is the project workspace for the **Ticko API
-Integration Challenge** and contains a working Ticko **Testnet** API
-integration.
+**A Ticko Testnet API integration project built with Next.js, TypeScript, and the App Router.**
 
-## What's implemented
+FranTicko is the project workspace for the **Ticko API Integration Challenge**. It provides a typed client for Ticko's REST API and implements authenticated trading operations using **Type A EIP-712 signing**.
 
-- **Ticko Testnet API integration** via `lib/ticko/*` (a small typed client that
-  wraps the public REST endpoints).
-- **Type A EIP-712 signing** (`lib/ticko/auth.ts`) for authenticated write
-  operations, including strictly-increasing, per-signer request nonces.
-- **Agent Wallet signing** — write requests are signed by an Agent/API key
-  (`signer_address`) using the configured agent private key.
-- **target_address support** — orders operate on a main account
-  (`target_address`) separate from the signing Agent wallet.
-- **Market symbols** — `GET /market/symbols` via the client.
-- **Account balance** — `GET /account/balance`.
-- **Place Order** — `POST /trade/orders` (limit/market, buy/sell, cross/isolated,
-  GTC/IOC/FOK, `post_only`, position side).
-- **Modify Order** — `POST /trade/orders/modify` (price changes).
-- **Cancel Order** — `POST /trade/orders/cancel`.
-- **Order Detail** — `GET /trade/order`.
-- **Executions** — `GET /trade/executions`.
-- **Price Match** — supported via the `price_match` field (`queue_1`, `queue_5`,
-  `counter_party_1`, `counter_party_5`).
-- **Server-side secret handling** — the private key is read only from the
-  server environment and is never sent to the browser.
+The project currently targets Ticko Testnet.
 
-A minimal verification route is available at
-`GET /api/ticko/symbols` (proxies `getSymbols()`).
+## Features
 
-## Security
+### Ticko API Integration
+- Typed API client implemented in `lib/ticko/`.
+- Public REST API integration for market and account data.
+- Server-side handling of authenticated trading requests.
 
-**`TICKO_AGENT_PRIVATE_KEY` is server-side only and must never be exposed to
-the browser or committed to source control.** It is read from `.env.local`,
-which is git-ignored. Keep it out of client components and out of any committed
-files.
+### Authentication & Signing
+- **Type A EIP-712 signing** for authenticated write operations.
+- Per-signer, strictly increasing request nonces.
+- Agent Wallet signing through the configured Agent private key.
+- Support for a separate `target_address`, allowing the Agent wallet to sign requests on behalf of the main account.
 
-## Testnet default
+### Market & Account Data
+- Market symbols — `GET /market/symbols`
+- Account balance — `GET /account/balance`
+- Order book data
+- Order details — `GET /trade/order`
+- Order history
+- Trade executions — `GET /trade/executions`
 
-**`TICKO_BASE_URL` defaults to the Ticko Testnet**
-(`https://api.testnet.ticko.xyz/v1`). Set it explicitly if you intend to target
-any other environment. Testnet is the supported default.
+### Trading Operations
+- **Place Order** — `POST /trade/orders`
+  - Limit and market orders
+  - Buy and sell sides
+  - Cross and isolated margin modes
+  - GTC, IOC, and FOK time-in-force options
+  - Post-only orders
+  - Position-side support
+- **Modify Order** — `POST /trade/orders/modify`
+- **Cancel Order** — `POST /trade/orders/cancel`
+- **Price Match** support:
+  - `queue_1`
+  - `queue_5`
+  - `counter_party_1`
+  - `counter_party_5`
+
+### Server-Side Security
+- Agent private keys are read exclusively from server environment variables.
+- Private keys are never exposed to browser-side code.
+- Sensitive configuration is stored locally in `.env.local`, which is excluded from Git.
+
+A minimal verification endpoint is also available:
+
+`GET /api/ticko/symbols`
+
+This route proxies the Ticko `getSymbols()` request.
+
+## Tech Stack
+
+- Next.js 16
+- React
+- TypeScript
+- Ticko REST API
+- Viem
+- EIP-712 Typed Data Signing
 
 ## Prerequisites
 
@@ -51,65 +70,78 @@ any other environment. Testnet is the supported default.
 
 ## Getting Started
 
-Install dependencies:
+Clone the repository and install dependencies:
 
 ```bash
 npm install
 ```
 
-Copy the environment template and fill in your values:
+Create your local environment file from the example:
 
 ```bash
 cp .env.example .env.local
 ```
 
-Run the development server:
+Configure the required environment variables in `.env.local`.
+
+Start the development server:
 
 ```bash
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the
-result.
-
-## Scripts
-
-- `npm run dev` — start the development server
-- `npm run build` — create a production build
-- `npm run start` — start the production server
-- `npm run lint` — run ESLint
+Open [http://localhost:3000](http://localhost:3000) in your browser.
 
 ## Environment Variables
 
-See the `.env.example` file for the available configuration variables:
+See `.env.example` for the available configuration variables.
 
-- `TICKO_BASE_URL` — Ticko REST base URL (defaults to Testnet).
-- `TICKO_AGENT_PRIVATE_KEY` — **secret.** Agent/API signer private key.
-- `TICKO_ACCOUNT_ADDRESS` — main account operated on (`target_address`).
-- `TICKO_AGENT_ADDRESS` — Agent wallet used as `signer_address`.
+| Variable | Description |
+|---|---|
+| `TICKO_BASE_URL` | Ticko REST API base URL. Defaults to Testnet. |
+| `TICKO_AGENT_PRIVATE_KEY` | Agent/API signer private key. **Secret.** |
+| `TICKO_AGENT_ADDRESS` | Agent wallet address used as `signer_address`. |
+| `TICKO_ACCOUNT_ADDRESS` | Main account address used as `target_address`. |
 
-Never commit real values. Use a local `.env.local` (git-ignored).
+**Security notice:** Never commit real credentials or private keys. Keep them in your local `.env.local` file and ensure they are never exposed to client-side code.
 
-## Tested on Ticko Testnet
+## Available Scripts
 
-Concise verification performed against Ticko Testnet (BTC-USDT, symbol 20001,
-quantity 0.001 per order):
+| Command | Description |
+|---|---|
+| `npm run dev` | Start the development server |
+| `npm run build` | Create a production build |
+| `npm run start` | Start the production server |
+| `npm run lint` | Run ESLint |
 
-- **Maker order placed and filled** via a post-only limit buy (resolved at
-  best bid; `is_maker = true`, maker fee).
-- **Modify** — a resting order's price was updated successfully.
-- **Cancel** — a resting order was cancelled to a terminal `cancelled` state
-  with zero executions.
-- **Price Match** — a `price_match = "queue_1"` buy was accepted and rested,
-  then filled as a maker at the resolving best-bid price.
+## Testnet Verification
 
-## Roadmap
+The following trading operations were tested against Ticko Testnet using **BTC-USDT (symbol ID: 20001)** and a quantity of **0.001 per order**.
 
-The following items have **not** been completed and are not claimed here:
+| Operation | Verification |
+|---|---|
+| Maker Order | A post-only limit buy was placed and filled at the best bid. The execution was confirmed as a maker trade (`is_maker = true`). |
+| Modify Order | The price of a resting order was successfully updated. |
+| Cancel Order | A resting order was successfully cancelled and reached the terminal `cancelled` state with zero executions. |
+| Price Match | A buy order using `price_match = "queue_1"` was accepted, rested, and subsequently filled as a maker at the resolving best-bid price. |
 
-- The full 10M API-trading-volume requirement (definition is external to the
-  Ticko API docs and has not been verified).
-- Demonstrating all four `price_match` values (only `queue_1` was verified).
-- Earning or confirming a challenge reward.
-- Production/mainnet support (this project targets the Ticko **Testnet** by
-  default).
+These results reflect the operations verified on Ticko Testnet.
+
+## Roadmap & Remaining Challenge Items
+
+The following items have not yet been completed or independently verified:
+
+- Full **10M API trading volume** requirement. Its definition is external to the Ticko API documentation and has not been verified.
+- Verification of all four `price_match` values. Only `queue_1` has been tested successfully.
+- Confirmation or receipt of a challenge reward.
+- Production/mainnet support. The current implementation targets Ticko Testnet.
+
+## Project Status
+
+FranTicko currently provides a working Ticko Testnet API integration and trading-operation workflow.
+
+Wallet connection and the public live-demo experience are planned for a later stage, following the availability of the required RPC infrastructure.
+
+---
+
+**Built for the Ticko API Integration Challenge.**

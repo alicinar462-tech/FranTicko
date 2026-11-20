@@ -6,10 +6,6 @@ import {
   type TickoStreamStatus,
 } from "../lib/ticko/orderbook-stream";
 import {
-  TickoTradesStream,
-  type TickoPublicTrade,
-} from "../lib/ticko/trades-stream";
-import {
   useCallback,
   useEffect,
   useMemo,
@@ -66,14 +62,20 @@ interface BalanceData {
   coins: BalanceCoin[];
 }
 
+interface BalanceResponse {
+  ok: boolean;
+  data?: BalanceData;
+  error?: string;
+}
+
 type TickoOrderBookLevel = [price: string, quantity: string];
 
 interface OrderBookData {
+  symbol_id: number;
   asks: TickoOrderBookLevel[];
   bids: TickoOrderBookLevel[];
-  seq: number;
-  symbol_id: number;
-  time: number;
+  seq?: number;
+  time?: number;
 }
 
 interface OrderBookResponse {
@@ -84,15 +86,32 @@ interface OrderBookResponse {
 
 interface SymbolsResponse {
   ok: boolean;
-  data?: {
+  data: {
     list: TickoSymbol[];
   };
   error?: string;
 }
 
-interface BalanceResponse {
+interface AccountActivityRecord {
+  [key: string]: unknown;
+}
+
+interface AccountActivityResponse {
   ok: boolean;
-  data?: BalanceData;
+  data?: {
+    list?: AccountActivityRecord[];
+    [key: string]: unknown;
+  };
+  error?: string;
+}
+
+interface PlaceOrderResponse {
+  ok: boolean;
+  data?: {
+    order_id: string;
+    tx_hash: string;
+    state: string;
+  };
   error?: string;
 }
 
@@ -103,30 +122,18 @@ interface DisplayOrderBookLevel {
   depthPercent: number;
 }
 
+type OrderMode = "maker" | "taker";
+type OrderSide = "buy" | "sell";
+type PriceMatch = "" | "opponent" | "queue";
+
 const DEFAULT_SYMBOL_ID = 20001;
 const USDT_COIN_ID = 1001;
 
-const PRICE_MATCH_OPTIONS = [
-  "queue_1",
-  "queue_5",
-  "counter_party_1",
-  "counter_party_5",
-] as const;
-
-type OrderSide = "buy" | "sell";
-type OrderMode = "maker" | "taker";
-type PriceMatch = (typeof PRICE_MATCH_OPTIONS)[number] | "";
-
-function shortenAddress(address: string) {
-  if (!address) return "—";
-  return `${address.slice(0, 6)}…${address.slice(-4)}`;
-}
-
 function formatNumber(
-  value: string | number | undefined,
-  decimals = 4,
-) {
-  if (value === undefined || value === null || value === "") {
+  value: string | number | null | undefined,
+  precision = 4,
+): string {
+  if (value === null || value === undefined || value === "") {
     return "—";
   }
 
@@ -136,9 +143,10 @@ function formatNumber(
     return String(value);
   }
 
-  return new Intl.NumberFormat("en-US", {
-    maximumFractionDigits: decimals,
-  }).format(number);
+  return number.toLocaleString(undefined, {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: precision,
+  });
 }
 
 function buildDepthLevels(
@@ -157,10 +165,11 @@ function buildDepthLevels(
       price,
       quantity,
       cumulative,
+      depthPercent: 0,
     };
   });
 
-  const maxCumulative = Math.max(
+  const maximum = Math.max(
     ...parsed.map((level) => level.cumulative),
     0,
   );
@@ -168,10 +177,61 @@ function buildDepthLevels(
   return parsed.map((level) => ({
     ...level,
     depthPercent:
-      maxCumulative > 0
-        ? (level.cumulative / maxCumulative) * 100
-        : 0,
+      maximum > 0 ? (level.cumulative / maximum) * 100 : 0,
   }));
+}
+
+function getRecordValue(
+  record: AccountActivityRecord,
+  keys: string[],
+): string {
+  for (const key of keys) {
+    const value = record[key];
+
+    if (value !== undefined && value !== null) {
+      return String(value);
+    }
+  }
+
+  return "—";
+}
+
+function formatExecutionTime(value: unknown): string {
+  if (value === null || value === undefined || value === "") {
+    return "—";
+  }
+
+  const numericValue = Number(value);
+  const date = Number.isFinite(numericValue)
+    ? new Date(numericValue)
+    : new Date(String(value));
+
+  if (Number.isNaN(date.getTime())) {
+    return String(value);
+  }
+
+  return date.toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function formatExecutionSide(value: unknown): string {
+  if (value === true || value === "true" || value === 1 || value === "1") {
+    return "Buy";
+  }
+
+  if (value === false || value === "false" || value === 0 || value === "0") {
+    return "Sell";
+  }
+
+  return value === null || value === undefined || value === ""
+    ? "—"
+    : String(value);
 }
 
 export default function Home() {
@@ -181,13 +241,21 @@ export default function Home() {
   const [balance, setBalance] = useState<BalanceData | null>(null);
   const [orderBook, setOrderBook] = useState<OrderBookData | null>(null);
 
+  const [accountOrders, setAccountOrders] = useState<
+    AccountActivityRecord[]
+  >([]);
+
+  const [accountExecutions, setAccountExecutions] = useState<
+    AccountActivityRecord[]
+  >([]);
+
+  const [loadingAccountActivity, setLoadingAccountActivity] =
+    useState(false);
+
+  const [accountActivityError, setAccountActivityError] = useState("");
+
   const [streamStatus, setStreamStatus] =
     useState<TickoStreamStatus>("disconnected");
-
-  const [trades, setTrades] = useState<TickoPublicTrade[]>([]);
-  const [tradesStreamStatus, setTradesStreamStatus] =
-    useState<TickoStreamStatus>("disconnected");
-  const [tradesError, setTradesError] = useState("");
 
   const [loadingMarket, setLoadingMarket] = useState(true);
   const [loadingBalance, setLoadingBalance] = useState(true);
@@ -199,14 +267,24 @@ export default function Home() {
 
   const [orderMode, setOrderMode] =
     useState<OrderMode>("maker");
+
   const [orderSide, setOrderSide] =
     useState<OrderSide>("buy");
+
   const [priceMatch, setPriceMatch] =
     useState<PriceMatch>("");
 
   const [orderPrice, setOrderPrice] = useState("");
-  const [orderQuantity, setOrderQuantity] =
-    useState("0.001");
+  const [orderQuantity, setOrderQuantity] = useState("0.001");
+
+  const [submittingOrder, setSubmittingOrder] = useState(false);
+  const [orderSubmitError, setOrderSubmitError] = useState("");
+
+  const [orderSubmitResult, setOrderSubmitResult] = useState<{
+    orderId: string;
+    txHash: string;
+    state: string;
+  } | null>(null);
 
   const loadMarket = useCallback(async () => {
     setLoadingMarket(true);
@@ -225,17 +303,19 @@ export default function Home() {
         );
       }
 
-      // Reference data supplies human-readable coin and market names.
-      // If it is temporarily unavailable, the dashboard keeps working
-      // with the existing ID-based fallback labels.
       try {
         const refResponse = await fetch("/api/ticko/ref-data", {
           cache: "no-store",
         });
 
-        const refResult = (await refResponse.json()) as RefDataResponse;
+        const refResult =
+          (await refResponse.json()) as RefDataResponse;
 
-        if (refResponse.ok && refResult.ok && refResult.data) {
+        if (
+          refResponse.ok &&
+          refResult.ok &&
+          refResult.data
+        ) {
           setRefData(refResult.data);
         } else {
           setRefData(null);
@@ -249,14 +329,17 @@ export default function Home() {
       );
 
       if (tradingSymbols.length === 0) {
-        throw new Error("No trading symbols are currently available.");
+        throw new Error(
+          "No trading symbols are currently available.",
+        );
       }
 
       setSymbols(tradingSymbols);
 
       setSymbol((currentSymbol) =>
         tradingSymbols.find(
-          (item) => item.symbol_id === currentSymbol?.symbol_id,
+          (item) =>
+            item.symbol_id === currentSymbol?.symbol_id,
         ) ??
           tradingSymbols.find(
             (item) => item.symbol_id === DEFAULT_SYMBOL_ID,
@@ -279,9 +362,12 @@ export default function Home() {
     setBalanceError("");
 
     try {
-      const response = await fetch("/api/ticko/balance", {
-        cache: "no-store",
-      });
+      const response = await fetch(
+        "/api/ticko/balance",
+        {
+          cache: "no-store",
+        },
+      );
 
       const result = (await response.json()) as BalanceResponse;
 
@@ -293,6 +379,7 @@ export default function Home() {
 
       setBalance(result.data);
     } catch (error) {
+      setBalance(null);
       setBalanceError(
         error instanceof Error
           ? error.message
@@ -308,10 +395,14 @@ export default function Home() {
       try {
         const response = await fetch(
           `/api/ticko/orderbook?symbol_id=${symbolId}&level=1`,
-          { cache: "no-store", signal },
+          {
+            cache: "no-store",
+            signal,
+          },
         );
 
-        const result = (await response.json()) as OrderBookResponse;
+        const result =
+          (await response.json()) as OrderBookResponse;
 
         if (!response.ok || !result.ok || !result.data) {
           throw new Error(
@@ -339,14 +430,97 @@ export default function Home() {
     [],
   );
 
-  const refreshAll = useCallback(() => {
-    void loadMarket();
-    void loadBalance();
-  }, [loadBalance, loadMarket]);
+  const loadAccountActivity = useCallback(
+    async (symbolId: number) => {
+      setLoadingAccountActivity(true);
+      setAccountActivityError("");
+
+      try {
+        const query = new URLSearchParams({
+          symbol_id: String(symbolId),
+          limit: "20",
+        });
+
+        const [ordersResponse, executionsResponse] =
+          await Promise.all([
+            fetch(
+              `/api/ticko/orders?${query.toString()}`,
+              {
+                cache: "no-store",
+              },
+            ),
+            fetch(
+              `/api/ticko/executions?${query.toString()}`,
+              {
+                cache: "no-store",
+              },
+            ),
+          ]);
+
+        const [ordersResult, executionsResult] =
+          (await Promise.all([
+            ordersResponse.json(),
+            executionsResponse.json(),
+          ])) as [
+            AccountActivityResponse,
+            AccountActivityResponse,
+          ];
+
+        if (
+          !ordersResponse.ok ||
+          !ordersResult.ok
+        ) {
+          throw new Error(
+            ordersResult.error ?? "Unable to load open orders.",
+          );
+        }
+
+        if (
+          !executionsResponse.ok ||
+          !executionsResult.ok
+        ) {
+          throw new Error(
+            executionsResult.error ?? "Unable to load executions.",
+          );
+        }
+
+        setAccountOrders(ordersResult.data?.list ?? []);
+        setAccountExecutions(executionsResult.data?.list ?? []);
+      } catch (error) {
+        setAccountOrders([]);
+        setAccountExecutions([]);
+
+        setAccountActivityError(
+          error instanceof Error
+            ? error.message
+            : "Unable to load account activity.",
+        );
+      } finally {
+        setLoadingAccountActivity(false);
+      }
+    },
+    [],
+  );
+
+  const refreshAll = useCallback(async () => {
+    await Promise.all([
+      loadMarket(),
+      loadBalance(),
+    ]);
+  }, [loadMarket, loadBalance]);
 
   useEffect(() => {
     void Promise.resolve().then(refreshAll);
   }, [refreshAll]);
+
+  // Load the server-configured Ticko account's order and execution history.
+  useEffect(() => {
+    if (!symbol) return;
+
+    void Promise.resolve().then(() =>
+      loadAccountActivity(symbol.symbol_id),
+    );
+  }, [symbol, loadAccountActivity]);
 
   // Load a REST snapshot for the currently selected symbol.
   useEffect(() => {
@@ -370,30 +544,20 @@ export default function Home() {
     const stream = new TickoOrderBookStream(symbol.symbol_id, {
       onBook: (book) => {
         setOrderBook({
-          asks: book.asks,
-          bids: book.bids,
-          seq: book.seq,
+          ...book,
           symbol_id: symbol.symbol_id,
-          time: book.time,
         });
 
         setLoadingOrderBook(false);
         setOrderBookError("");
       },
+
       onStatus: (status) => {
         setStreamStatus(status);
-
-        // Never keep displaying an old order book while the stream is
-        // connecting, reconnecting, offline, or in an error state.
-        // The stream reports "connected" only after a fresh snapshot arrives.
-        if (status !== "connected") {
-          setOrderBook(null);
-          setLoadingOrderBook(true);
-          setOrderBookError("");
-        }
       },
-      onError: (error) => {
-        setOrderBookError(error);
+
+      onError: (message) => {
+        setOrderBookError(message);
       },
     });
 
@@ -404,888 +568,570 @@ export default function Home() {
     };
   }, [symbol]);
 
-  // Start the independent public Ticko trade stream.
-  useEffect(() => {
+  const askLevels = useMemo(
+    () => buildDepthLevels(orderBook?.asks ?? []),
+    [orderBook],
+  );
+
+  const bidLevels = useMemo(
+    () => buildDepthLevels(orderBook?.bids ?? []),
+    [orderBook],
+  );
+
+  // Derive the best prices from the current order book snapshot/stream.
+  // Do not rely on API array ordering: choose the numeric maximum bid
+  // and numeric minimum ask while preserving the original price string.
+  const bestBid = useMemo(() => {
+    const levels = orderBook?.bids ?? [];
+    let best: TickoOrderBookLevel | null = null;
+
+    for (const level of levels) {
+      if (!best || Number(level[0]) > Number(best[0])) {
+        best = level;
+      }
+    }
+
+    return best?.[0] ?? null;
+  }, [orderBook]);
+
+  const bestAsk = useMemo(() => {
+    const levels = orderBook?.asks ?? [];
+    let best: TickoOrderBookLevel | null = null;
+
+    for (const level of levels) {
+      if (!best || Number(level[0]) < Number(best[0])) {
+        best = level;
+      }
+    }
+
+    return best?.[0] ?? null;
+  }, [orderBook]);
+
+  const selectedSymbolLabel = useMemo(() => {
+    if (!symbol || !refData) return "Market";
+
+    const entry = Object.values(refData.symbols).find(
+      (item) => item.symbol_id === symbol.symbol_id,
+    );
+
+    return entry?.symbol ?? "Market";
+  }, [symbol, refData]);
+
+  const baseCoinLabel = useMemo(() => {
+    if (!symbol || !refData) return "Base";
+
+    const entry = Object.values(refData.coins).find(
+      (item) => item.coin_id === symbol.base_coin_id,
+    );
+
+    return entry?.coin ?? "Base";
+  }, [symbol, refData]);
+
+  const quoteCoinLabel = useMemo(() => {
+    if (!symbol || !refData) return "Quote";
+
+    const entry = Object.values(refData.coins).find(
+      (item) => item.coin_id === symbol.quote_coin_id,
+    );
+
+    return entry?.coin ?? "Quote";
+  }, [symbol, refData]);
+
+  const priceUnitLabel = quoteCoinLabel;
+  const quantityUnitLabel = baseCoinLabel;
+
+  const handlePriceMatch = useCallback(
+    (match: PriceMatch) => {
+      setPriceMatch(match);
+
+      if (match === "opponent") {
+        const opponentPrice =
+          orderSide === "buy" ? bestAsk : bestBid;
+
+        if (opponentPrice) {
+          setOrderPrice(opponentPrice);
+        }
+      }
+
+      if (match === "queue") {
+        const queuePrice =
+          orderSide === "buy" ? bestBid : bestAsk;
+
+        if (queuePrice) {
+          setOrderPrice(queuePrice);
+        }
+      }
+    },
+    [orderSide, bestAsk, bestBid],
+  );
+
+  const submitOrder = useCallback(async () => {
     if (!symbol) return;
 
-    const stream = new TickoTradesStream(symbol.symbol_id, {
-      onTrades: (nextTrades) => {
-        setTrades(nextTrades);
-        setTradesError("");
-      },
-      onStatus: (status) => {
-        setTradesStreamStatus(status);
-      },
-      onError: (error) => {
-        setTradesError(error);
-      },
-    });
+    setSubmittingOrder(true);
+    setOrderSubmitError("");
+    setOrderSubmitResult(null);
 
-    stream.start();
+    try {
+      const response = await fetch("/api/ticko/place-order", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          symbol_id: symbol.symbol_id,
+          is_buy: orderSide === "buy",
+          order_type: orderMode === "maker" ? "limit" : "market",
+          time_in_force: orderMode === "maker" ? "gtc" : "ioc",
+          quantity: orderQuantity,
+          ...(orderMode === "maker"
+            ? priceMatch
+              ? {
+                  price_match:
+                    priceMatch === "queue" ? "queue_1" : "counter_party_1",
+                }
+              : { price: orderPrice }
+            : {}),
+          position_side: "both",
+          margin_mode: "cross",
+        }),
+      });
 
-    return () => {
-      stream.stop();
-    };
-  }, [symbol]);
+      const result =
+        (await response.json()) as PlaceOrderResponse;
 
-  const usdtBalance = useMemo(() => {
+      if (!response.ok || !result.ok || !result.data) {
+        throw new Error(
+          result.error ?? "Unable to submit order.",
+        );
+      }
+
+      setOrderSubmitResult({
+        orderId: result.data.order_id,
+        txHash: result.data.tx_hash,
+        state: result.data.state,
+      });
+
+      await Promise.all([
+        loadBalance(),
+        loadAccountActivity(symbol.symbol_id),
+      ]);
+    } catch (error) {
+      setOrderSubmitError(
+        error instanceof Error
+          ? error.message
+          : "Unable to submit order.",
+      );
+    } finally {
+      setSubmittingOrder(false);
+    }
+  }, [
+    symbol,
+    orderSide,
+    orderMode,
+    priceMatch,
+    orderPrice,
+    orderQuantity,
+    loadBalance,
+    loadAccountActivity,
+  ]);
+
+  if (loadingMarket) {
     return (
-      balance?.coins.find(
-        (coin) => coin.coin_id === USDT_COIN_ID,
-      )?.balance ?? null
+      <main className="min-h-screen bg-zinc-950 text-zinc-100">
+        <div className="mx-auto flex min-h-screen max-w-7xl items-center justify-center px-6">
+          <div className="text-center">
+            <div className="mx-auto mb-4 h-8 w-8 animate-spin rounded-full border-2 border-zinc-700 border-t-amber-400" />
+            <p className="text-sm text-zinc-400">
+              Loading FranTicko...
+            </p>
+          </div>
+        </div>
+      </main>
     );
-  }, [balance]);
+  }
 
-  const bestBid = orderBook?.bids[0] ?? null;
-  const bestAsk = orderBook?.asks[0] ?? null;
-
-  const spread = useMemo(() => {
-    if (!bestBid || !bestAsk) return null;
-
-    const difference = Number(bestAsk[0]) - Number(bestBid[0]);
-
-    return Number.isFinite(difference) ? difference : null;
-  }, [bestAsk, bestBid]);
-
-  const askLevels = useMemo(() => {
-    if (!orderBook) return [];
-
-    // API asks are best-to-worst. Reverse for the conventional display:
-    // highest ask at the top, best ask nearest the spread.
-    return buildDepthLevels([...orderBook.asks].reverse());
-  }, [orderBook]);
-
-  const bidLevels = useMemo(() => {
-    if (!orderBook) return [];
-
-    // API bids are already best-to-worst.
-    return buildDepthLevels(orderBook.bids);
-  }, [orderBook]);
-
-  const connectionReady =
-    !loadingMarket &&
-    !loadingBalance &&
-    !marketError &&
-    !balanceError &&
-    Boolean(symbol) &&
-    Boolean(balance);
-
-  const priceMatchSelected = priceMatch !== "";
-
-  const baseCoinName = symbol
-    ? refData?.coins[String(symbol.base_coin_id)]?.coin
-    : undefined;
-
-  const quoteCoinName = symbol
-    ? refData?.coins[String(symbol.quote_coin_id)]?.coin
-    : undefined;
-
-  const selectedSymbolLabel = symbol
-    ? refData?.symbols[String(symbol.symbol_id)]?.symbol ??
-      `Symbol #${symbol.symbol_id}`
-    : "No symbol selected";
-
-  const baseCoinLabel = symbol
-    ? `Base: ${baseCoinName ?? `#${symbol.base_coin_id}`}`
-    : "Base Coin —";
-
-  const quoteCoinLabel = symbol
-    ? `Quote: ${quoteCoinName ?? `#${symbol.quote_coin_id}`}`
-    : "Quote Coin —";
-
-  const priceUnitLabel = symbol
-    ? quoteCoinName ?? `Quote #${symbol.quote_coin_id}`
-    : "Quote —";
-
-  const quantityUnitLabel = symbol
-    ? baseCoinName ?? `Base #${symbol.base_coin_id}`
-    : "Base —";
+  if (marketError) {
+    return (
+      <main className="min-h-screen bg-zinc-950 text-zinc-100">
+        <div className="mx-auto flex min-h-screen max-w-7xl items-center justify-center px-6">
+          <div className="max-w-md rounded-2xl border border-red-900/60 bg-red-950/20 p-6 text-center">
+            <h1 className="text-lg font-semibold text-red-300">
+              Unable to load FranTicko
+            </h1>
+            <p className="mt-3 text-sm text-zinc-400">
+              {marketError}
+            </p>
+            <button
+              type="button"
+              onClick={refreshAll}
+              className="mt-5 rounded-lg bg-zinc-800 px-4 py-2 text-sm font-medium text-zinc-100 hover:bg-zinc-700"
+            >
+              Retry
+            </button>
+          </div>
+        </div>
+      </main>
+    );
+  }
 
   return (
     <main className="min-h-screen bg-zinc-950 text-zinc-100">
-      <div className="mx-auto w-full max-w-7xl px-6 py-8 lg:px-8">
-        <header className="mb-8 flex flex-col gap-5 border-b border-zinc-800 pb-6 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex items-center">
-            <Image
-              src="/franticko-logo.png"
-              alt="FranTicko"
-              width={120}
-              height={75}
-              priority
-              className="h-[72px] w-[120px] object-contain"
-            />
+      <div className="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
+        <header className="mb-6 flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div className="relative h-10 w-10 overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900">
+              <Image
+                src="/partio-logo.png"
+                alt="FranTicko"
+                fill
+                className="object-contain p-1"
+                priority
+              />
+            </div>
+
+            <div>
+              <h1 className="text-xl font-bold tracking-tight">
+                FranTicko
+              </h1>
+              <p className="text-xs text-zinc-500">
+                Ticko Testnet Trading Dashboard
+              </p>
+            </div>
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
-            <div className="flex items-center gap-2 rounded-full border border-zinc-800 bg-zinc-900 px-3 py-2 text-sm">
+            <div className="flex items-center gap-2 rounded-full border border-zinc-800 bg-zinc-900 px-3 py-2">
               <span
                 className={`h-2 w-2 rounded-full ${
-                  connectionReady
+                  streamStatus === "connected"
                     ? "bg-emerald-400"
-                    : "bg-amber-400"
+                    : streamStatus === "connecting"
+                      ? "bg-amber-400"
+                      : "bg-zinc-500"
                 }`}
               />
-
-              <span className="text-zinc-300">
-                Ticko Testnet
+              <span className="text-xs text-zinc-400">
+                Order Book{" "}
+                {streamStatus === "connected"
+                  ? "Live"
+                  : streamStatus}
               </span>
-            </div>
-
-            <div className="rounded-lg border border-cyan-900/60 bg-cyan-950/20 px-3 py-2 text-xs font-medium text-cyan-300">
-              Agent Pioneer
             </div>
 
             <button
               type="button"
               onClick={refreshAll}
-              disabled={
-                loadingMarket ||
-                loadingBalance ||
-                loadingOrderBook
-              }
-              className="rounded-lg border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+              className="rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 text-xs font-medium text-zinc-300 transition hover:border-zinc-700 hover:bg-zinc-800"
             >
-              {loadingMarket || loadingBalance || loadingOrderBook
-                ? "Refreshing..."
-                : "Refresh"}
+              Refresh
             </button>
           </div>
         </header>
 
-        <section className="mb-6 grid gap-4 md:grid-cols-3">
+        <section className="mb-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           <div className="rounded-2xl border border-zinc-800 bg-zinc-900/70 p-5">
-            <div className="flex items-center justify-between">
-              <p className="text-sm text-zinc-500">
-                Ticko Trading Account
-              </p>
+            <p className="text-xs font-medium uppercase tracking-wider text-zinc-500">
+              Account
+            </p>
+            <p className="mt-2 text-lg font-semibold">
+              Agent Wallet
+            </p>
+            <p className="mt-1 text-xs text-zinc-500">
+              Server-configured Ticko account
+            </p>
+          </div>
 
-              <span className="rounded-full bg-cyan-400/10 px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-cyan-400">
-                API
-              </span>
-            </div>
-
-            <div className="mt-3">
-              <span className="font-mono text-sm text-zinc-200">
-                {balance?.address
-                  ? shortenAddress(balance.address)
-                  : loadingBalance
-                    ? "Loading..."
-                    : "Unavailable"}
-              </span>
-            </div>
-
-            <p className="mt-2 text-xs text-zinc-600">
-              Server-side trading account
+          <div className="rounded-2xl border border-zinc-800 bg-zinc-900/70 p-5">
+            <p className="text-xs font-medium uppercase tracking-wider text-zinc-500">
+              Available Balance
             </p>
 
-            {balanceError && (
-              <p className="mt-3 text-xs text-red-400">
+            {loadingBalance ? (
+              <p className="mt-2 text-sm text-zinc-500">
+                Loading balance...
+              </p>
+            ) : balanceError ? (
+              <p className="mt-2 text-sm text-red-400">
                 {balanceError}
               </p>
+            ) : (
+              <div className="mt-2 space-y-1">
+                {balance?.coins
+                  .filter(
+                    (coin) =>
+                      Number(coin.balance) > 0 ||
+                      Number(coin.isolated_balance) > 0,
+                  )
+                  .map((coin) => {
+                    const coinName =
+                      Object.values(refData?.coins ?? {}).find(
+                        (item) => item.coin_id === coin.coin_id,
+                      )?.coin ?? `Coin ${coin.coin_id}`;
+
+                    return (
+                      <div
+                        key={coin.coin_id}
+                        className="flex items-center justify-between gap-3"
+                      >
+                        <span className="text-sm font-medium text-zinc-300">
+                          {coinName}
+                        </span>
+                        <span className="font-mono text-sm text-zinc-100">
+                          {formatNumber(coin.balance, 8)}
+                        </span>
+                      </div>
+                    );
+                  })}
+
+                {(!balance?.coins ||
+                  balance.coins.filter(
+                    (coin) =>
+                      Number(coin.balance) > 0 ||
+                      Number(coin.isolated_balance) > 0,
+                  ).length === 0) && (
+                  <p className="text-sm text-zinc-500">
+                    No available balance.
+                  </p>
+                )}
+              </div>
             )}
           </div>
 
           <div className="rounded-2xl border border-zinc-800 bg-zinc-900/70 p-5">
-            <div className="flex items-center justify-between">
-              <p className="text-sm text-zinc-500">
-                Order Integration
-              </p>
+            <p className="text-xs font-medium uppercase tracking-wider text-zinc-500">
+              Selected Market
+            </p>
 
-              <span className="h-2 w-2 rounded-full bg-amber-400" />
+            <div className="mt-2 flex items-center justify-between gap-3">
+              <select
+                value={symbol?.symbol_id ?? ""}
+                onChange={(event) => {
+                  const nextSymbol = symbols.find(
+                    (item) =>
+                      item.symbol_id === Number(event.target.value),
+                  );
+
+                  if (nextSymbol) {
+                    setSymbol(nextSymbol);
+                    setOrderBook(null);
+                    setLoadingOrderBook(true);
+                    setOrderBookError("");
+                    setPriceMatch("");
+                    setOrderPrice("");
+                  }
+                }}
+                className="min-w-0 flex-1 rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-amber-500"
+              >
+                {symbols.map((item) => {
+                  const label =
+                    Object.values(refData?.symbols ?? {}).find(
+                      (entry) => entry.symbol_id === item.symbol_id,
+                    )?.symbol ?? `Symbol ${item.symbol_id}`;
+
+                  return (
+                    <option
+                      key={item.symbol_id}
+                      value={item.symbol_id}
+                    >
+                      {label}
+                    </option>
+                  );
+                })}
+              </select>
+
+              <span className="shrink-0 rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-xs text-zinc-400">
+                ID {symbol?.symbol_id}
+              </span>
             </div>
 
-            <p className="mt-3 text-lg font-semibold">
-              Read-only API
-            </p>
-
-            <p className="mt-2 text-xs text-zinc-600">
-              Account data is available. Order submission is not connected.
-            </p>
-          </div>
-
-          <div className="rounded-2xl border border-zinc-800 bg-zinc-900/70 p-5">
-            <p className="text-sm text-zinc-500">
-              USDT Balance
-            </p>
-
-            <div className="mt-2">
-              {loadingBalance ? (
-                <div className="h-9 w-40 animate-pulse rounded bg-zinc-800" />
-              ) : (
-                <p className="text-3xl font-semibold tracking-tight">
-                  {formatNumber(
-                    usdtBalance ?? undefined,
-                    2,
-                  )}
-
-                  <span className="ml-2 text-base font-medium text-zinc-500">
-                    USDT
-                  </span>
-                </p>
-              )}
-            </div>
-
-            <p className="mt-2 text-xs text-zinc-600">
-              Coin ID {USDT_COIN_ID}
+            <p className="mt-2 text-xs text-zinc-500">
+              {symbol?.trading_mode ?? "—"} ·{" "}
+              {symbol?.status ?? "—"}
             </p>
           </div>
         </section>
 
-        <section className="mb-6 grid gap-6 lg:grid-cols-[1.5fr_1fr]">
+        <section className="mb-6 grid gap-4 lg:grid-cols-[1.2fr_0.8fr]">
           <div className="rounded-2xl border border-zinc-800 bg-zinc-900/70">
-            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-800 px-5 py-4">
+            <div className="flex items-center justify-between border-b border-zinc-800 px-5 py-4">
               <div>
                 <p className="text-xs font-medium uppercase tracking-wider text-zinc-500">
                   Market
                 </p>
-
-                <div className="mt-2 flex flex-wrap items-center gap-3">
-                  <h2 className="text-lg font-semibold">
-                    {symbol ? selectedSymbolLabel : "Loading symbol..."}
-                  </h2>
-
-                  <select
-                    aria-label="Select trading symbol"
-                    value={symbol ? String(symbol.symbol_id) : ""}
-                    onChange={(event) => {
-                      const selectedSymbol = symbols.find(
-                        (item) => item.symbol_id === Number(event.target.value),
-                      );
-
-                      if (selectedSymbol) {
-                        setTrades([]);
-                        setTradesError("");
-                        setSymbol(selectedSymbol);
-                      }
-                    }}
-                    disabled={loadingMarket || symbols.length === 0}
-                    className="rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-200 outline-none transition focus:border-cyan-500 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {symbols.map((item) => (
-                      <option key={item.symbol_id} value={item.symbol_id}>
-                        {`${refData?.symbols[String(item.symbol_id)]?.symbol ?? `Symbol #${item.symbol_id}`} · ${refData?.coins[String(item.base_coin_id)]?.coin ?? `#${item.base_coin_id}`} / ${refData?.coins[String(item.quote_coin_id)]?.coin ?? `#${item.quote_coin_id}`}`}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
-                  <span className="rounded-md border border-cyan-900/60 bg-cyan-950/30 px-2 py-1 text-cyan-300">
-                    {baseCoinLabel}
-                  </span>
-                  <span className="rounded-md border border-violet-900/60 bg-violet-950/30 px-2 py-1 text-violet-300">
-                    {quoteCoinLabel}
-                  </span>
-                </div>
+                <h2 className="mt-1 text-lg font-semibold">
+                  Order Book
+                </h2>
               </div>
 
-              {symbol && (
-                <span
-                  className={`rounded-full px-3 py-1 text-xs font-medium ${
-                    symbol.status === "trading"
-                      ? "bg-emerald-400/10 text-emerald-400"
-                      : "bg-amber-400/10 text-amber-400"
-                  }`}
-                >
-                  {symbol.status}
-                </span>
-              )}
-            </div>
-
-            <div className="grid gap-px bg-zinc-800 sm:grid-cols-2">
-              <div className="bg-zinc-900/90 p-5">
-                <p className="text-sm text-zinc-500">
-                  Best Bid
-                </p>
-
-                <p className="mt-2 text-2xl font-semibold text-emerald-400">
-                  {loadingOrderBook
-                    ? "Loading..."
-                    : bestBid
-                      ? formatNumber(bestBid[0], symbol?.price_precision ?? 4)
-                      : "—"}
-                </p>
-
-                <p className="mt-1 text-xs text-zinc-500">
-                  Price in {priceUnitLabel}
-                </p>
-
-                <p className="mt-1 text-xs text-zinc-500">
-                  {bestBid
-                    ? `Quantity: ${formatNumber(bestBid[1], symbol?.qty_precision ?? 4)} ${quantityUnitLabel}`
-                    : "Best available buy price"}
-                </p>
-              </div>
-
-              <div className="bg-zinc-900/90 p-5">
-                <p className="text-sm text-zinc-500">
-                  Best Ask
-                </p>
-
-                <p className="mt-2 text-2xl font-semibold text-red-400">
-                  {loadingOrderBook
-                    ? "Loading..."
-                    : bestAsk
-                      ? formatNumber(bestAsk[0], symbol?.price_precision ?? 4)
-                      : "—"}
-                </p>
-
-                <p className="mt-1 text-xs text-zinc-500">
-                  Price in {priceUnitLabel}
-                </p>
-
-                <p className="mt-1 text-xs text-zinc-500">
-                  {bestAsk
-                    ? `Quantity: ${formatNumber(bestAsk[1], symbol?.qty_precision ?? 4)} ${quantityUnitLabel}`
-                    : "Best available sell price"}
-                </p>
-              </div>
-            </div>
-
-            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-zinc-800 px-5 py-3">
-              <span className="text-xs text-zinc-500">
-                Spread: {spread === null ? "—" : `${formatNumber(spread, symbol?.price_precision ?? 4)} ${priceUnitLabel}`}
-              </span>
-
-              <span className="text-xs text-zinc-600">
-                {orderBook
-                  ? `Updated ${new Date(orderBook.time).toLocaleTimeString()}`
-                  : loadingOrderBook
-                    ? "Fetching order book..."
-                    : "Order book unavailable"}
+              <span
+                className={`rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-wider ${
+                  streamStatus === "connected"
+                    ? "bg-emerald-500/10 text-emerald-400"
+                    : "bg-zinc-800 text-zinc-400"
+                }`}
+              >
+                {streamStatus}
               </span>
             </div>
 
-            {orderBookError && (
-              <div className="border-t border-zinc-800 px-5 py-3">
+            {orderBookError ? (
+              <div className="px-5 py-8 text-center">
                 <p className="text-sm text-red-400">
                   {orderBookError}
                 </p>
               </div>
-            )}
-
-            {marketError && (
-              <div className="border-t border-zinc-800 px-5 py-4">
-                <p className="text-sm text-red-400">
-                  {marketError}
+            ) : loadingOrderBook && !orderBook ? (
+              <div className="px-5 py-12 text-center">
+                <div className="mx-auto mb-3 h-6 w-6 animate-spin rounded-full border-2 border-zinc-700 border-t-amber-400" />
+                <p className="text-sm text-zinc-500">
+                  Loading order book...
                 </p>
               </div>
-            )}
-
-            <div className="border-t border-zinc-800 px-5 py-4">
-              <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-                <div>
-                  <h3 className="text-sm font-semibold text-zinc-200">
-                    Market Depth
-                  </h3>
-                  <p className="mt-1 text-[11px] text-zinc-500">
-                    {selectedSymbolLabel} · Price: {priceUnitLabel} · Quantity: {quantityUnitLabel}
-                  </p>
-                </div>
-
-                <span
-                  className={`inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-[10px] font-medium ${
-                    streamStatus === "connected"
-                      ? "bg-emerald-400/10 text-emerald-400"
-                      : streamStatus === "connecting" ||
-                          streamStatus === "reconnecting"
-                        ? "bg-amber-400/10 text-amber-400"
-                        : streamStatus === "error"
-                          ? "bg-red-400/10 text-red-400"
-                          : "bg-zinc-800 text-zinc-500"
-                  }`}
-                >
-                  <span
-                    className={`h-1.5 w-1.5 rounded-full ${
-                      streamStatus === "connected"
-                        ? "bg-emerald-400"
-                        : streamStatus === "connecting" ||
-                            streamStatus === "reconnecting"
-                          ? "bg-amber-400"
-                          : streamStatus === "error"
-                            ? "bg-red-400"
-                            : "bg-zinc-500"
-                    }`}
-                  />
-
-                  {streamStatus === "connected"
-                    ? "Live"
-                    : streamStatus === "connecting"
-                      ? "Connecting"
-                      : streamStatus === "reconnecting"
-                        ? "Reconnecting"
-                        : streamStatus === "error"
-                          ? "Stream error"
-                          : "Offline"}
-                </span>
-              </div>
-
-              <div className="grid grid-cols-[1fr_1fr] gap-4">
-                <div className="min-w-0">
-                  <div className="mb-2 flex items-center justify-between border-b border-zinc-800 pb-2">
-                    <span className="text-xs font-semibold uppercase tracking-wider text-red-400">
+            ) : (
+              <div className="grid grid-cols-2 gap-0">
+                <div className="border-r border-zinc-800">
+                  <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-3">
+                    <span className="text-xs font-semibold text-red-400">
                       Asks
                     </span>
-
                     <span className="text-[10px] text-zinc-600">
-                      Sell
+                      Price / Quantity
                     </span>
                   </div>
 
-                  <div className="mb-2 grid grid-cols-3 gap-1 text-[10px] text-zinc-600">
-                    <span>Price ({priceUnitLabel})</span>
-                    <span className="text-right">Amount ({quantityUnitLabel})</span>
-                    <span className="text-right">Total ({quantityUnitLabel})</span>
-                  </div>
-
-                  <div className="space-y-1">
-                    {loadingOrderBook && !orderBook ? (
-                      <p className="py-6 text-center text-xs text-zinc-600">
-                        Loading asks...
-                      </p>
-                    ) : askLevels.length > 0 ? (
-                      askLevels.map((level, index) => (
+                  <div className="space-y-1 p-3">
+                    {askLevels.slice(0, 10).map((level, index) => (
+                      <div
+                        key={`${level.price}-${index}`}
+                        className="relative grid grid-cols-2 gap-2 overflow-hidden rounded px-2 py-1.5 font-mono text-xs"
+                      >
                         <div
-                          key={`ask-${level.price}-${index}`}
-                          className="relative grid grid-cols-3 gap-1 overflow-hidden rounded px-1 py-1.5 font-mono text-[11px] sm:text-xs"
-                        >
-                          <div
-                            className="absolute inset-y-0 right-0 bg-red-500/10"
-                            style={{
-                              width: `${level.depthPercent}%`,
-                            }}
-                          />
+                          className="absolute inset-y-0 right-0 bg-red-500/10"
+                          style={{
+                            width: `${level.depthPercent}%`,
+                          }}
+                        />
+                        <span className="relative text-red-400">
+                          {formatNumber(
+                            level.price,
+                            symbol?.price_precision ?? 4,
+                          )}
+                        </span>
+                        <span className="relative text-right text-zinc-400">
+                          {formatNumber(
+                            level.quantity,
+                            symbol?.qty_precision ?? 4,
+                          )}
+                        </span>
+                      </div>
+                    ))}
 
-                          <span className="relative z-10 text-red-400">
-                            {formatNumber(level.price, symbol?.price_precision ?? 4)}
-                          </span>
-
-                          <span className="relative z-10 text-right text-zinc-300">
-                            {formatNumber(level.quantity, symbol?.qty_precision ?? 4)}
-                          </span>
-
-                          <span className="relative z-10 text-right text-zinc-500">
-                            {formatNumber(level.cumulative, symbol?.qty_precision ?? 4)}
-                          </span>
-                        </div>
-                      ))
-                    ) : (
-                      <p className="py-6 text-center text-xs text-zinc-600">
-                        No ask levels available
+                    {askLevels.length === 0 && (
+                      <p className="py-8 text-center text-xs text-zinc-600">
+                        No ask levels.
                       </p>
                     )}
                   </div>
                 </div>
 
-                <div className="min-w-0">
-                  <div className="mb-2 flex items-center justify-between border-b border-zinc-800 pb-2">
-                    <span className="text-xs font-semibold uppercase tracking-wider text-emerald-400">
+                <div>
+                  <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-3">
+                    <span className="text-xs font-semibold text-emerald-400">
                       Bids
                     </span>
-
                     <span className="text-[10px] text-zinc-600">
-                      Buy
+                      Price / Quantity
                     </span>
                   </div>
 
-                  <div className="mb-2 grid grid-cols-3 gap-1 text-[10px] text-zinc-600">
-                    <span>Price ({priceUnitLabel})</span>
-                    <span className="text-right">Amount ({quantityUnitLabel})</span>
-                    <span className="text-right">Total ({quantityUnitLabel})</span>
-                  </div>
-
-                  <div className="space-y-1">
-                    {loadingOrderBook && !orderBook ? (
-                      <p className="py-6 text-center text-xs text-zinc-600">
-                        Loading bids...
-                      </p>
-                    ) : bidLevels.length > 0 ? (
-                      bidLevels.map((level, index) => (
+                  <div className="space-y-1 p-3">
+                    {bidLevels.slice(0, 10).map((level, index) => (
+                      <div
+                        key={`${level.price}-${index}`}
+                        className="relative grid grid-cols-2 gap-2 overflow-hidden rounded px-2 py-1.5 font-mono text-xs"
+                      >
                         <div
-                          key={`bid-${level.price}-${index}`}
-                          className="relative grid grid-cols-3 gap-1 overflow-hidden rounded px-1 py-1.5 font-mono text-[11px] sm:text-xs"
-                        >
-                          <div
-                            className="absolute inset-y-0 right-0 bg-emerald-500/10"
-                            style={{
-                              width: `${level.depthPercent}%`,
-                            }}
-                          />
+                          className="absolute inset-y-0 right-0 bg-emerald-500/10"
+                          style={{
+                            width: `${level.depthPercent}%`,
+                          }}
+                        />
+                        <span className="relative text-emerald-400">
+                          {formatNumber(
+                            level.price,
+                            symbol?.price_precision ?? 4,
+                          )}
+                        </span>
+                        <span className="relative text-right text-zinc-400">
+                          {formatNumber(
+                            level.quantity,
+                            symbol?.qty_precision ?? 4,
+                          )}
+                        </span>
+                      </div>
+                    ))}
 
-                          <span className="relative z-10 text-emerald-400">
-                            {formatNumber(level.price, symbol?.price_precision ?? 4)}
-                          </span>
-
-                          <span className="relative z-10 text-right text-zinc-300">
-                            {formatNumber(level.quantity, symbol?.qty_precision ?? 4)}
-                          </span>
-
-                          <span className="relative z-10 text-right text-zinc-500">
-                            {formatNumber(level.cumulative, symbol?.qty_precision ?? 4)}
-                          </span>
-                        </div>
-                      ))
-                    ) : (
-                      <p className="py-6 text-center text-xs text-zinc-600">
-                        No bid levels available
+                    {bidLevels.length === 0 && (
+                      <p className="py-8 text-center text-xs text-zinc-600">
+                        No bid levels.
                       </p>
                     )}
                   </div>
                 </div>
               </div>
+            )}
 
-              {orderBook && (
-                <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-zinc-800 pt-3 text-[10px] text-zinc-600">
-                  <span>
-                    Sequence: {orderBook.seq}
-                  </span>
+            <div className="grid grid-cols-2 border-t border-zinc-800">
+              <div className="border-r border-zinc-800 px-5 py-4">
+                <p className="text-[10px] font-medium uppercase tracking-wider text-zinc-500">
+                  Best Bid
+                </p>
+                <p className="mt-1 font-mono text-lg font-semibold text-emerald-400">
+                  {bestBid
+                    ? formatNumber(
+                        bestBid,
+                        symbol?.price_precision ?? 4,
+                      )
+                    : "—"}
+                </p>
+              </div>
 
-                  <span>
-                    Symbol ID: {orderBook.symbol_id}
-                  </span>
-
-                  <span>
-                    Data time: {new Date(orderBook.time).toLocaleTimeString()}
-                  </span>
-                </div>
-              )}
+              <div className="px-5 py-4">
+                <p className="text-[10px] font-medium uppercase tracking-wider text-zinc-500">
+                  Best Ask
+                </p>
+                <p className="mt-1 font-mono text-lg font-semibold text-red-400">
+                  {bestAsk
+                    ? formatNumber(
+                        bestAsk,
+                        symbol?.price_precision ?? 4,
+                      )
+                    : "—"}
+                </p>
+              </div>
             </div>
           </div>
 
           <div className="rounded-2xl border border-zinc-800 bg-zinc-900/70">
             <div className="border-b border-zinc-800 px-5 py-4">
               <p className="text-xs font-medium uppercase tracking-wider text-zinc-500">
-                Symbol Configuration
+                Trading
               </p>
-
               <h2 className="mt-1 text-lg font-semibold">
-                {symbol ? selectedSymbolLabel : "Loading..."}
+                Place Order
               </h2>
-
-              <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
-                <span className="rounded-md border border-cyan-900/60 bg-cyan-950/30 px-2 py-1 text-cyan-300">
-                  {baseCoinLabel}
-                </span>
-                <span className="rounded-md border border-violet-900/60 bg-violet-950/30 px-2 py-1 text-violet-300">
-                  {quoteCoinLabel}
-                </span>
-              </div>
             </div>
 
-            <div className="divide-y divide-zinc-800">
-              <div className="flex items-center justify-between px-5 py-3">
-                <span className="text-sm text-zinc-500">
-                  Symbol ID
-                </span>
-
-                <span className="font-mono text-sm">
-                  {symbol?.symbol_id ?? "—"}
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between px-5 py-3">
-                <span className="text-sm text-zinc-500">
-                  Base Coin ID
-                </span>
-
-                <span className="font-mono text-sm">
-                  {symbol
-                    ? `${baseCoinName ?? "Unknown"} (#${symbol.base_coin_id})`
-                    : "—"}
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between px-5 py-3">
-                <span className="text-sm text-zinc-500">
-                  Quote Coin ID
-                </span>
-
-                <span className="font-mono text-sm">
-                  {symbol
-                    ? `${quoteCoinName ?? "Unknown"} (#${symbol.quote_coin_id})`
-                    : "—"}
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between px-5 py-3">
-                <span className="text-sm text-zinc-500">
-                  Trading status
-                </span>
-
-                <span className="text-sm font-medium">
-                  {symbol?.status ?? "—"}
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between px-5 py-3">
-                <span className="text-sm text-zinc-500">
-                  Trading mode
-                </span>
-
-                <span className="text-sm font-medium">
-                  {symbol?.trading_mode ?? "—"}
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between px-5 py-3">
-                <span className="text-sm text-zinc-500">
-                  Price precision
-                </span>
-
-                <span className="font-mono text-sm">
-                  {symbol?.price_precision ?? "—"}
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between px-5 py-3">
-                <span className="text-sm text-zinc-500">
-                  Quantity precision
-                </span>
-
-                <span className="font-mono text-sm">
-                  {symbol?.qty_precision ?? "—"}
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between px-5 py-3">
-                <span className="text-sm text-zinc-500">
-                  Price step
-                </span>
-
-                <span className="font-mono text-sm">
-                  {symbol?.price_step ?? "—"}
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between px-5 py-3">
-                <span className="text-sm text-zinc-500">
-                  Quantity step
-                </span>
-
-                <span className="font-mono text-sm">
-                  {symbol?.qty_step ?? "—"}
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between px-5 py-3">
-                <span className="text-sm text-zinc-500">
-                  Minimum size
-                </span>
-
-                <span className="font-mono text-sm">
-                  {symbol?.min_size ?? "—"}
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between px-5 py-3">
-                <span className="text-sm text-zinc-500">
-                  Maximum size
-                </span>
-
-                <span className="font-mono text-sm">
-                  {symbol?.max_size ?? "—"}
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between px-5 py-3">
-                <span className="text-sm text-zinc-500">
-                  Max leverage
-                </span>
-
-                <span className="font-mono text-sm">
-                  {symbol?.max_leverage
-                    ? `${symbol.max_leverage}x`
-                    : "—"}
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between px-5 py-3">
-                <span className="text-sm text-zinc-500">
-                  Default leverage
-                </span>
-
-                <span className="font-mono text-sm">
-                  {symbol?.default_leverage
-                    ? `${symbol.default_leverage}x`
-                    : "—"}
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between px-5 py-3">
-                <span className="text-sm text-zinc-500">
-                  Price limit (%)
-                </span>
-
-                <span className="font-mono text-sm">
-                  {symbol?.price_limit_pct ?? "—"}
-                </span>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        {/* Live Trades */}
-        <section className="mb-6 rounded-2xl border border-zinc-800 bg-zinc-900/70">
-          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-800 px-5 py-4">
-            <div>
-              <p className="text-xs font-medium uppercase tracking-wider text-zinc-500">
-                Market Activity
-              </p>
-
-              <h2 className="mt-1 text-lg font-semibold">
-                Live Trades
-              </h2>
-
-              <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
-                <span className="rounded-md border border-zinc-700 bg-zinc-950 px-2 py-1 text-zinc-300">
-                  {selectedSymbolLabel}
-                </span>
-                <span className="rounded-md border border-cyan-900/60 bg-cyan-950/30 px-2 py-1 text-cyan-300">
-                  Price: {priceUnitLabel}
-                </span>
-                <span className="rounded-md border border-violet-900/60 bg-violet-950/30 px-2 py-1 text-violet-300">
-                  Quantity: {quantityUnitLabel}
-                </span>
-              </div>
-            </div>
-
-            <div className="flex items-center gap-2 rounded-full border border-zinc-800 bg-zinc-950 px-3 py-1.5 text-xs">
-              <span
-                className={`h-2 w-2 rounded-full ${
-                  tradesStreamStatus === "connected"
-                    ? "bg-emerald-400"
-                    : tradesStreamStatus === "connecting" ||
-                        tradesStreamStatus === "reconnecting"
-                      ? "bg-amber-400"
-                      : tradesStreamStatus === "error"
-                        ? "bg-red-400"
-                        : "bg-zinc-500"
-                }`}
-              />
-
-              <span className="text-zinc-300">
-                {tradesStreamStatus === "connected"
-                  ? "Live"
-                  : tradesStreamStatus === "connecting"
-                    ? "Connecting"
-                    : tradesStreamStatus === "reconnecting"
-                      ? "Reconnecting"
-                      : tradesStreamStatus === "error"
-                        ? "Stream error"
-                        : "Offline"}
-              </span>
-            </div>
-          </div>
-
-          {tradesError && (
-            <div className="border-b border-zinc-800 px-5 py-3">
-              <p className="text-xs text-red-400">
-                {tradesError}
-              </p>
-            </div>
-          )}
-
-          <div className="overflow-x-auto">
-            <div className="min-w-[620px]">
-              <div className="grid grid-cols-[1.2fr_1fr_1fr_1fr_1fr] gap-3 border-b border-zinc-800 px-5 py-3 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
-                <span>Price ({priceUnitLabel})</span>
-                <span className="text-right">Quantity ({quantityUnitLabel})</span>
-                <span className="text-right">Amount ({priceUnitLabel})</span>
-                <span className="text-right">Time</span>
-                <span className="text-right">Trade ID</span>
-              </div>
-
-              {trades.length > 0 ? (
-                <div className="divide-y divide-zinc-800/70">
-                  {trades.map((trade, index) => (
-                    <div
-                      key={`${trade.tradeId}-${index}`}
-                      className="grid grid-cols-[1.2fr_1fr_1fr_1fr_1fr] items-center gap-3 px-5 py-3 font-mono text-xs"
-                    >
-                      <span className="font-semibold text-zinc-100">
-                        {formatNumber(trade.price, symbol?.price_precision ?? 4)}
-                      </span>
-
-                      <span className="text-right text-zinc-300">
-                        {formatNumber(trade.quantity, symbol?.qty_precision ?? 4)}
-                      </span>
-
-                      <span className="text-right text-zinc-300">
-                        {formatNumber(trade.amount, 2)}
-                      </span>
-
-                      <span className="text-right text-zinc-400">
-                        {new Date(trade.time).toLocaleTimeString()}
-                      </span>
-
-                      <span
-                        className="text-right text-zinc-500"
-                        title={trade.tradeId}
-                      >
-                        {trade.tradeId.length > 12
-                          ? `${trade.tradeId.slice(0, 8)}…`
-                          : trade.tradeId}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="px-5 py-10 text-center text-sm text-zinc-600">
-                  {tradesStreamStatus === "connecting" ||
-                  tradesStreamStatus === "reconnecting"
-                    ? "Waiting for live trades..."
-                    : tradesStreamStatus === "error"
-                      ? "Live trades are currently unavailable."
-                      : "No trades received yet."}
-                </p>
-              )}
-            </div>
-          </div>
-
-          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-zinc-800 px-5 py-3 text-[10px] text-zinc-600">
-            <span>
-              {selectedSymbolLabel} · {baseCoinLabel} / {quoteCoinLabel}
-            </span>
-
-            <span>
-              {trades.length} / 50 recent trades
-            </span>
-          </div>
-        </section>
-
-        <section className="rounded-2xl border border-zinc-800 bg-zinc-900/70">
-          <div className="border-b border-zinc-800 px-5 py-5">
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-              <div>
-                <p className="text-xs font-medium uppercase tracking-wider text-zinc-500">
-                  TESTNET PREVIEW
-                </p>
-
-                <h2 className="mt-1 text-xl font-semibold">
-                  Order Preview
-                </h2>
-              </div>
-
-              <span className="rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-300">
-                {selectedSymbolLabel} · {baseCoinLabel} / {quoteCoinLabel}
-              </span>
-            </div>
-          </div>
-
-          <div className="grid gap-6 p-5 lg:grid-cols-[1fr_1.4fr]">
-            <div>
-              <p className="mb-3 text-sm font-medium text-zinc-300">
-                Order side
-              </p>
-
+            <div className="space-y-5 p-5">
               <div className="grid grid-cols-2 gap-2">
                 <button
                   type="button"
                   onClick={() => setOrderSide("buy")}
-                  className={`rounded-lg border px-4 py-3 text-sm font-semibold transition ${
+                  className={`rounded-lg px-4 py-3 text-sm font-semibold transition ${
                     orderSide === "buy"
-                      ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-400"
-                      : "border-zinc-700 bg-zinc-900 text-zinc-500 hover:bg-zinc-800"
+                      ? "bg-emerald-500 text-zinc-950"
+                      : "border border-zinc-700 bg-zinc-950 text-zinc-400 hover:bg-zinc-800"
                   }`}
                 >
                   Buy
@@ -1294,242 +1140,395 @@ export default function Home() {
                 <button
                   type="button"
                   onClick={() => setOrderSide("sell")}
-                  className={`rounded-lg border px-4 py-3 text-sm font-semibold transition ${
+                  className={`rounded-lg px-4 py-3 text-sm font-semibold transition ${
                     orderSide === "sell"
-                      ? "border-red-500/50 bg-red-500/10 text-red-400"
-                      : "border-zinc-700 bg-zinc-900 text-zinc-500 hover:bg-zinc-800"
+                      ? "bg-red-500 text-white"
+                      : "border border-zinc-700 bg-zinc-950 text-zinc-400 hover:bg-zinc-800"
                   }`}
                 >
                   Sell
                 </button>
               </div>
 
-              <p className="mb-3 mt-6 text-sm font-medium text-zinc-300">
-                Execution mode
-              </p>
-
               <div className="grid grid-cols-2 gap-2">
                 <button
                   type="button"
-                  onClick={() => {
-                    setOrderMode("maker");
-                    setPriceMatch("");
-                  }}
-                  className={`rounded-lg border px-4 py-3 text-sm font-semibold transition ${
+                  onClick={() => setOrderMode("maker")}
+                  className={`rounded-lg px-4 py-2.5 text-xs font-semibold transition ${
                     orderMode === "maker"
-                      ? "border-cyan-500/50 bg-cyan-500/10 text-cyan-300"
-                      : "border-zinc-700 bg-zinc-900 text-zinc-500 hover:bg-zinc-800"
+                      ? "border border-amber-500/50 bg-amber-500/10 text-amber-300"
+                      : "border border-zinc-800 bg-zinc-950 text-zinc-500 hover:bg-zinc-800"
                   }`}
                 >
-                  Maker
+                  Limit
                 </button>
 
                 <button
                   type="button"
                   onClick={() => setOrderMode("taker")}
-                  className={`rounded-lg border px-4 py-3 text-sm font-semibold transition ${
+                  className={`rounded-lg px-4 py-2.5 text-xs font-semibold transition ${
                     orderMode === "taker"
-                      ? "border-violet-500/50 bg-violet-500/10 text-violet-300"
-                      : "border-zinc-700 bg-zinc-900 text-zinc-500 hover:bg-zinc-800"
+                      ? "border border-amber-500/50 bg-amber-500/10 text-amber-300"
+                      : "border border-zinc-800 bg-zinc-950 text-zinc-500 hover:bg-zinc-800"
                   }`}
                 >
-                  Taker
+                  Market
                 </button>
               </div>
 
-              <div className="mt-6 rounded-xl border border-zinc-800 bg-zinc-950/60 p-4">
-                <p className="text-xs font-medium uppercase tracking-wider text-zinc-600">
-                  Integration status
-                </p>
-
-                <p className="mt-2 text-sm leading-6 text-zinc-400">
-                  This is a local preview only. No order is sent to
-                  Ticko Testnet.
-                </p>
-              </div>
-            </div>
-
-            <div className="space-y-5">
               <div>
                 <label
-                  htmlFor="price-match"
-                  className="mb-2 block text-sm font-medium text-zinc-300"
+                  htmlFor="order-price"
+                  className="mb-2 block text-xs font-medium uppercase tracking-wider text-zinc-500"
                 >
-                  Price Match
+                  Price ({priceUnitLabel})
                 </label>
 
-                <select
-                  id="price-match"
-                  value={priceMatch}
-                  onChange={(event) =>
-                    setPriceMatch(
-                      event.target.value as PriceMatch,
-                    )
-                  }
-                  className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-4 py-3 text-sm text-zinc-200 outline-none transition focus:border-cyan-500"
-                >
-                  <option value="">
-                    No Price Match
-                  </option>
+                <input
+                  id="order-price"
+                  type="text"
+                  inputMode="decimal"
+                  value={orderPrice}
+                  onChange={(event) => {
+                    setOrderPrice(event.target.value);
+                    setPriceMatch("");
+                  }}
+                  placeholder="Enter price"
+                  disabled={orderMode === "taker"}
+                  className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-3 font-mono text-sm text-zinc-100 outline-none transition focus:border-amber-500 disabled:opacity-50"
+                />
 
-                  {PRICE_MATCH_OPTIONS.map((option) => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
-                </select>
-
-                <p className="mt-2 text-xs text-zinc-600">
-                  {priceMatchSelected
-                    ? "Preview only. This Price Match rule is not sent to Ticko."
-                    : "Preview only. The limit price is not submitted to Ticko."}
-                </p>
-              </div>
-
-              <div className="grid gap-4 sm:grid-cols-2">
-                <div>
-                  <label
-                    htmlFor="order-price"
-                    className="mb-2 block text-sm font-medium text-zinc-300"
-                  >
-                    Price ({priceUnitLabel})
-                  </label>
-
-                  <input
-                    id="order-price"
-                    type="text"
-                    inputMode="decimal"
-                    value={orderPrice}
-                    onChange={(event) =>
-                      setOrderPrice(event.target.value)
-                    }
-                    disabled={priceMatchSelected}
-                    placeholder={
-                      priceMatchSelected
-                        ? "Price Match preview only"
-                        : "Enter price"
-                    }
-                    className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-4 py-3 font-mono text-sm text-zinc-200 outline-none transition placeholder:text-zinc-700 focus:border-cyan-500 disabled:cursor-not-allowed disabled:opacity-50"
-                  />
-                </div>
-
-                <div>
-                  <label
-                    htmlFor="order-quantity"
-                    className="mb-2 block text-sm font-medium text-zinc-300"
-                  >
-                    Quantity ({quantityUnitLabel})
-                  </label>
-
-                  <input
-                    id="order-quantity"
-                    type="text"
-                    inputMode="decimal"
-                    value={orderQuantity}
-                    onChange={(event) =>
-                      setOrderQuantity(event.target.value)
-                    }
-                    placeholder="0.001"
-                    className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-4 py-3 font-mono text-sm text-zinc-200 outline-none transition placeholder:text-zinc-700 focus:border-cyan-500"
-                  />
-                </div>
-              </div>
-
-              <div className="rounded-xl border border-zinc-800 bg-zinc-950/60 p-4">
-                <div className="flex items-center justify-between">
-                  <span className="text-sm text-zinc-500">
-                    Selected market
-                  </span>
-
-                  <span className="text-sm font-semibold text-zinc-200">
-                    {selectedSymbolLabel}
-                  </span>
-                </div>
-
-                <div className="mt-3 flex items-center justify-between">
-                  <span className="text-sm text-zinc-500">
-                    Base / Quote
-                  </span>
-
-                  <span className="text-sm font-medium text-zinc-300">
-                    {baseCoinName ?? `#${symbol?.base_coin_id ?? "—"}`} / {quoteCoinName ?? `#${symbol?.quote_coin_id ?? "—"}`}
-                  </span>
-                </div>
-
-                <div className="mt-3 flex items-center justify-between">
-                  <span className="text-sm text-zinc-500">
-                    Side
-                  </span>
-
-                  <span
-                    className={`text-sm font-semibold ${
-                      orderSide === "buy"
-                        ? "text-emerald-400"
-                        : "text-red-400"
+                <div className="mt-2 grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => handlePriceMatch("queue")}
+                    disabled={orderMode === "taker" || (!bestBid && !bestAsk)}
+                    className={`flex items-center justify-between gap-2 rounded-lg border px-3 py-2 text-xs transition ${
+                      priceMatch === "queue"
+                        ? "border-amber-500/50 bg-amber-500/10 text-amber-300"
+                        : "border-zinc-800 bg-zinc-950 text-zinc-400 hover:bg-zinc-800"
                     }`}
                   >
-                    {orderSide.toUpperCase()}
-                  </span>
+                    <span className="shrink-0 font-semibold">
+                      Queue
+                    </span>
+                    <span className="truncate font-mono">
+                      {orderSide === "buy"
+                        ? bestBid
+                          ? formatNumber(
+                              bestBid,
+                              symbol?.price_precision ?? 4,
+                            )
+                          : "—"
+                        : bestAsk
+                          ? formatNumber(
+                              bestAsk,
+                              symbol?.price_precision ?? 4,
+                            )
+                          : "—"}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handlePriceMatch("opponent")}
+                    disabled={orderMode === "taker" || (!bestBid && !bestAsk)}
+                    className={`flex items-center justify-between gap-2 rounded-lg border px-3 py-2 text-xs transition ${
+                      priceMatch === "opponent"
+                        ? "border-amber-500/50 bg-amber-500/10 text-amber-300"
+                        : "border-zinc-800 bg-zinc-950 text-zinc-400 hover:bg-zinc-800"
+                    }`}
+                  >
+                    <span className="shrink-0 font-semibold">
+                      Opponent
+                    </span>
+                    <span className="truncate font-mono">
+                      {orderSide === "buy"
+                        ? bestAsk
+                          ? formatNumber(
+                              bestAsk,
+                              symbol?.price_precision ?? 4,
+                            )
+                          : "—"
+                        : bestBid
+                          ? formatNumber(
+                              bestBid,
+                              symbol?.price_precision ?? 4,
+                            )
+                          : "—"}
+                    </span>
+                  </button>
                 </div>
 
-                <div className="mt-3 flex items-center justify-between">
-                  <span className="text-sm text-zinc-500">
-                    Mode
-                  </span>
+                <div className="mt-2 grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (bestBid) setOrderPrice(bestBid);
+                      setPriceMatch("queue");
+                    }}
+                    disabled={orderMode === "taker" || !bestBid}
+                    className="flex items-center justify-between gap-2 rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-xs text-zinc-400 transition hover:bg-zinc-800 disabled:opacity-40"
+                  >
+                    <span className="shrink-0 font-semibold text-emerald-400">
+                      Best Bid
+                    </span>
+                    <span className="truncate font-mono text-zinc-200">
+                      {bestBid
+                        ? formatNumber(
+                            bestBid,
+                            symbol?.price_precision ?? 4,
+                          )
+                        : "—"}
+                    </span>
+                  </button>
 
-                  <span className="text-sm font-medium text-zinc-300">
-                    {orderMode.toUpperCase()}
-                  </span>
-                </div>
-
-                <div className="mt-3 flex items-center justify-between">
-                  <span className="text-sm text-zinc-500">
-                    Price Match
-                  </span>
-
-                  <span className="font-mono text-sm text-zinc-300">
-                    {priceMatch || "—"}
-                  </span>
-                </div>
-
-                <div className="mt-3 flex items-center justify-between">
-                  <span className="text-sm text-zinc-500">
-                    Price
-                  </span>
-
-                  <span className="font-mono text-sm text-zinc-300">
-                    {orderPrice || "—"} {priceUnitLabel}
-                  </span>
-                </div>
-
-                <div className="mt-3 flex items-center justify-between">
-                  <span className="text-sm text-zinc-500">
-                    Quantity
-                  </span>
-
-                  <span className="font-mono text-sm text-zinc-300">
-                    {orderQuantity || "—"} {quantityUnitLabel}
-                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (bestAsk) setOrderPrice(bestAsk);
+                      setPriceMatch("opponent");
+                    }}
+                    disabled={orderMode === "taker" || !bestAsk}
+                    className="flex items-center justify-between gap-2 rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-xs text-zinc-400 transition hover:bg-zinc-800 disabled:opacity-40"
+                  >
+                    <span className="shrink-0 font-semibold text-red-400">
+                      Best Ask
+                    </span>
+                    <span className="truncate font-mono text-zinc-200">
+                      {bestAsk
+                        ? formatNumber(
+                            bestAsk,
+                            symbol?.price_precision ?? 4,
+                          )
+                        : "—"}
+                    </span>
+                  </button>
                 </div>
               </div>
 
-              <button
-                type="button"
-                disabled
-                className="w-full rounded-lg bg-cyan-400 px-5 py-3 text-sm font-semibold text-zinc-950 opacity-50"
-              >
-                Order submission unavailable
-              </button>
+              <div>
+                <label
+                  htmlFor="order-quantity"
+                  className="mb-2 block text-xs font-medium uppercase tracking-wider text-zinc-500"
+                >
+                  Quantity ({quantityUnitLabel})
+                </label>
 
-              <p className="text-center text-xs text-zinc-600">
-                Order submission is disabled. No transaction or order
-                will be created from this screen.
-              </p>
+                <input
+                  id="order-quantity"
+                  type="text"
+                  inputMode="decimal"
+                  value={orderQuantity}
+                  onChange={(event) =>
+                    setOrderQuantity(event.target.value)
+                  }
+                  placeholder="Enter quantity"
+                  className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-3 font-mono text-sm text-zinc-100 outline-none transition focus:border-amber-500"
+                />
+              </div>
+
+              <div className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-3">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-zinc-500">
+                    Estimated Order Value
+                  </span>
+
+                  <span className="font-mono text-zinc-200">
+                    {orderPrice && orderQuantity
+                      ? formatNumber(
+                          Number(orderPrice) * Number(orderQuantity),
+                          4,
+                        )
+                      : "—"}{" "}
+                    {priceUnitLabel}
+                  </span>
+                </div>
+              </div>
             </div>
+          </div>
+
+          <div className="border-t border-zinc-800 p-5">
+            <button
+              type="button"
+              onClick={submitOrder}
+              disabled={
+                submittingOrder ||
+                !symbol ||
+                loadingMarket
+              }
+              className={`w-full rounded-lg px-4 py-3 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                orderSide === "buy"
+                  ? "bg-emerald-500 text-zinc-950 hover:bg-emerald-400"
+                  : "bg-red-500 text-white hover:bg-red-400"
+              }`}
+            >
+              {submittingOrder
+                ? "Submitting..."
+                : `${orderSide === "buy" ? "Buy" : "Sell"} ${selectedSymbolLabel}`}
+            </button>
+
+            <p className="mt-3 text-center text-[10px] text-zinc-500">
+              Ticko Testnet · Signed order submission · No live trading
+            </p>
+
+            {orderSubmitError && (
+              <div className="mt-4 rounded-lg border border-red-900/60 bg-red-950/30 px-4 py-3">
+                <p className="text-sm text-red-300">
+                  {orderSubmitError}
+                </p>
+              </div>
+            )}
+
+            {orderSubmitResult && (
+              <div className="mt-4 rounded-lg border border-emerald-900/60 bg-emerald-950/30 px-4 py-3">
+                <p className="text-sm font-semibold text-emerald-300">
+                  Order submitted successfully
+                </p>
+
+                <p className="mt-2 break-all text-xs text-zinc-400">
+                  Order ID: {orderSubmitResult.orderId}
+                </p>
+
+                <p className="mt-1 break-all text-xs text-zinc-400">
+                  Transaction: {orderSubmitResult.txHash}
+                </p>
+
+                <p className="mt-1 text-xs text-zinc-400">
+                  State: {orderSubmitResult.state}
+                </p>
+              </div>
+            )}
           </div>
         </section>
 
-        <footer className="mt-8 border-t border-zinc-800 pt-5 text-xs text-zinc-600">
+        <section className="mb-6 grid gap-4 lg:grid-cols-2">
+          <div className="rounded-2xl border border-zinc-800 bg-zinc-900/70">
+            <div className="border-b border-zinc-800 px-5 py-4">
+              <p className="text-xs font-medium uppercase tracking-wider text-zinc-500">
+                Account
+              </p>
+
+              <h2 className="mt-1 text-lg font-semibold">
+                Open Orders
+              </h2>
+            </div>
+
+            {loadingAccountActivity ? (
+              <p className="px-5 py-8 text-center text-sm text-zinc-500">
+                Loading orders...
+              </p>
+            ) : accountActivityError ? (
+              <p className="px-5 py-8 text-center text-sm text-red-400">
+                {accountActivityError}
+              </p>
+            ) : accountOrders.length > 0 ? (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="border-b border-zinc-800 text-zinc-500">
+                    <tr>
+                      <th className="px-5 py-3 font-medium">Order ID</th>
+                      <th className="px-5 py-3 font-medium">Side</th>
+                      <th className="px-5 py-3 font-medium">Price</th>
+                      <th className="px-5 py-3 font-medium">Quantity</th>
+                      <th className="px-5 py-3 font-medium">Status</th>
+                    </tr>
+                  </thead>
+
+                  <tbody className="divide-y divide-zinc-800/60">
+                    {accountOrders.map((record, index) => (
+                      <tr key={getRecordValue(record, ["order_id", "id"]) + index}>
+                        <td className="px-5 py-3 font-mono text-zinc-400">
+                          {getRecordValue(record, ["order_id", "id"])}
+                        </td>
+                        <td className="px-5 py-3 text-zinc-300">
+                          {getRecordValue(record, ["side", "is_buy"])}
+                        </td>
+                        <td className="px-5 py-3 font-mono text-zinc-300">
+                          {getRecordValue(record, ["price", "limit_price"])}
+                        </td>
+                        <td className="px-5 py-3 font-mono text-zinc-300">
+                          {getRecordValue(record, ["quantity", "qty", "size"])}
+                        </td>
+                        <td className="px-5 py-3 text-zinc-400">
+                          {getRecordValue(record, ["state", "status"])}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <p className="px-5 py-8 text-center text-sm text-zinc-600">
+                No open orders.
+              </p>
+            )}
+          </div>
+
+          <div className="rounded-2xl border border-zinc-800 bg-zinc-900/70">
+            <div className="border-b border-zinc-800 px-5 py-4">
+              <p className="text-xs font-medium uppercase tracking-wider text-zinc-500">
+                Account
+              </p>
+
+              <h2 className="mt-1 text-lg font-semibold">
+                Recent Executions
+              </h2>
+            </div>
+
+            {loadingAccountActivity ? (
+              <p className="px-5 py-8 text-center text-sm text-zinc-500">
+                Loading executions...
+              </p>
+            ) : accountActivityError ? (
+              <p className="px-5 py-8 text-center text-sm text-red-400">
+                {accountActivityError}
+              </p>
+            ) : accountExecutions.length > 0 ? (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="border-b border-zinc-800 text-zinc-500">
+                    <tr>
+                      <th className="px-5 py-3 font-medium">Execution</th>
+                      <th className="px-5 py-3 font-medium">Side</th>
+                      <th className="px-5 py-3 font-medium">Price</th>
+                      <th className="px-5 py-3 font-medium">Quantity</th>
+                      <th className="px-5 py-3 font-medium">Time</th>
+                    </tr>
+                  </thead>
+
+                  <tbody className="divide-y divide-zinc-800/60">
+                    {accountExecutions.map((record, index) => (
+                      <tr key={getRecordValue(record, ["trade_id", "execution_id", "id"]) + index}>
+                        <td className="px-5 py-3 font-mono text-zinc-400">
+                          {getRecordValue(record, ["trade_id", "execution_id", "id"])}
+                        </td>
+                        <td className="px-5 py-3 text-zinc-300">
+                          {formatExecutionSide(record.is_buy ?? record.side)}
+                        </td>
+                        <td className="px-5 py-3 font-mono text-zinc-300">
+                          {getRecordValue(record, ["price", "fill_price"])}
+                        </td>
+                        <td className="px-5 py-3 font-mono text-zinc-300">
+                          {getRecordValue(record, ["quantity", "qty", "size"])}
+                        </td>
+                        <td className="px-5 py-3 text-zinc-400">
+                          {formatExecutionTime(record.time ?? record.created_at ?? record.timestamp)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <p className="px-5 py-8 text-center text-sm text-zinc-600">
+                No recent executions.
+              </p>
+            )}
+          </div>
+        </section>
+
+        <footer className="pb-8 text-center text-xs text-zinc-600">
           FranTicko · Ticko Testnet · Agent Pioneer Dashboard
         </footer>
       </div>
